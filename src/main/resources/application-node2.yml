@@ -12,7 +12,7 @@ raft:
   port: 8082
   peers: 127.0.0.1:8081,127.0.0.1:8082,127.0.0.1:8083
   data-dir: D:/project/Claudecode/raft-kv-store/data/node2
-  initializer: false
+  initializer: true
   read-timeout: 3000
   write-timeout: 3000
 

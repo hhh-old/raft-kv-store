@@ -134,23 +134,24 @@ public class RaftKVService {
         // 作用：避免节点重启后需要从头回放所有日志，加速恢复过程
         nodeOptions.setSnapshotUri(raftProperties.getDataDir() + File.separator + "snapshot");
 
-        // 如果当前节点是初始化节点（集群中第一个启动的节点），需要设置初始集群配置
-        // 只有初始化节点需要设置 initialConf，其他节点通过 Raft 协议自动学习集群配置
+        // 所有节点都需要设置初始集群配置
+        // initializer 节点会基于这个配置发起第一次选举
+        // non-initializer 节点会尝试连接到这些节点并加入集群
+        Configuration initConf = new Configuration();
+        
+        // 解析 peers 字符串（格式：ip1:port1,ip2:port2,ip3:port3）
+        // 这个配置定义了集群中有哪些节点
+        if (!initConf.parse(raftProperties.getPeers())) {
+            throw new IllegalArgumentException("Failed to parse peers: " + raftProperties.getPeers());
+        }
+        
+        // 设置初始集群配置
+        // 这个配置告诉 Raft 节点：集群初始成员有哪些
+        nodeOptions.setInitialConf(initConf);
+        LOG.info("Node configured with initial conf: {}", raftProperties.getPeers());
+        
         if (raftProperties.isInitializer()) {
-            // 创建集群配置对象
-            Configuration initConf = new Configuration();
-            
-            // 解析 peers 字符串（格式：ip1:port1,ip2:port2,ip3:port3）
-            // 这个配置定义了集群中有哪些节点
-            if (!initConf.parse(raftProperties.getPeers())) {
-                throw new IllegalArgumentException("Failed to parse peers: " + raftProperties.getPeers());
-            }
-            
-            // 设置初始集群配置
-            // 这个配置告诉 Raft 节点：集群初始成员有哪些
-            // 初始化节点会基于这个配置发起第一次选举
-            nodeOptions.setInitialConf(initConf);
-            LOG.info("This node is the initializer with initial conf: {}", raftProperties.getPeers());
+            LOG.info("This node is the initializer - will initiate the cluster");
         }
 
         // 创建状态机实例
