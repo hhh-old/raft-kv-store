@@ -1,0 +1,235 @@
+# ====================================
+# Raft KV Store - Git Ignore
+# ====================================
+
+# ====================================
+# Java & Maven
+# ====================================
+
+# Maven
+target/
+pom.xml.tag
+pom.xml.releaseBackup
+pom.xml.versionsBackup
+pom.xml.next
+release.properties
+dependency-reduced-pom.xml
+buildNumber.properties
+.mvn/timing.properties
+.mvn/wrapper/maven-wrapper.jar
+
+# Eclipse
+.classpath
+.project
+.settings/
+bin/
+
+# IntelliJ IDEA
+.idea/
+*.iws
+*.iml
+*.ipr
+out/
+**/misc.xml
+**/workspace.xml
+**/tasks.xml
+**/usage.statistics.xml
+
+# NetBeans
+nbproject/private/
+nbbuild/
+dist/
+nbdist/
+.nb-gradle/
+
+# VS Code
+.vscode/
+
+# ====================================
+# Runtime Data
+# ====================================
+
+# Raft data directories (运行时数据)
+data/
+**/log/
+**/raft_meta/
+**/snapshot/
+
+# Log files
+*.log
+logs/
+**/*.log
+
+# ====================================
+# OS Files
+# ====================================
+
+# Windows
+Thumbs.db
+Thumbs.db:encryptable
+ehthumbs.db
+ehthumbs_vista.db
+*.stackdump
+[Dd]esktop.ini
+$RECYCLE.BIN/
+*.cab
+*.msi
+*.msix
+*.msm
+*.msp
+*.lnk
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+Icon
+._*
+.DocumentRevisions-V100
+.fseventsd
+.Spotlight-V100
+.TemporaryItems
+.Trashes
+.VolumeIcon.icns
+.com.apple.timemachine.donotpresent
+.AppleDB
+.AppleDesktop
+Network Trash Folder
+Temporary Items
+.apdisk
+
+# Linux
+*~
+.directory
+.Trash-*
+.nfs*
+
+# ====================================
+# IDE Configuration
+# ====================================
+
+# Application properties (local configs)
+**/application-local.yml
+**/application-local.properties
+
+# Environment files
+.env
+.env.local
+.env.*.local
+
+# ====================================
+# Build & Package
+# ====================================
+
+# JAR files (generated)
+*.jar
+*.war
+*.ear
+*.class
+
+# Packaging
+*.zip
+*.tar.gz
+*.rar
+
+# ====================================
+# Temporary Files
+# ====================================
+
+# Backup files
+*.bak
+*.backup
+*.swp
+*.swo
+*~
+
+# Temp files
+*.tmp
+*.temp
+tmp/
+temp/
+
+# ====================================
+# Client Build
+# ====================================
+
+# Client target
+client/target/
+client/**/*.class
+
+# ====================================
+# Documentation (Optional)
+# ====================================
+
+# 如果要忽略自动生成的文档，取消下面的注释
+# *.md
+# docs/
+
+# ====================================
+# Sensitive Information
+# ====================================
+
+# Keystore files
+*.jks
+*.p12
+*.pfx
+*.keystore
+
+# Certificates
+*.pem
+*.key
+*.crt
+*.cer
+
+# ====================================
+# Database Files
+# ====================================
+
+*.db
+*.sqlite
+*.h2.db
+
+# ====================================
+# Script Output
+# ====================================
+
+# PID files
+*.pid
+*.PID
+
+# Lock files
+*.lock
+
+# ====================================
+# Coverage & Reports
+# ====================================
+
+# Code coverage
+coverage/
+cobertura.ser
+**/clover/
+
+# Test reports
+test-reports/
+surefire-reports/
+failsafe-reports/
+
+# ====================================
+# Docker
+# ====================================
+
+# Docker files (如果要保留 Dockerfile，注释掉)
+# .dockerignore
+# docker-compose.yml
+
+# ====================================
+# Notes
+# ====================================
+
+# 保留的配置文件（不要忽略）
+# - config/*.yml
+# - config/*.yaml
+# - scripts/*.sh
+# - scripts/*.bat
+# - *.md (文档)
+# - pom.xml

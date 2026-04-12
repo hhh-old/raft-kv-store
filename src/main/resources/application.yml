@@ -1,0 +1,23 @@
+server:
+  port: 9081
+
+spring:
+  application:
+    name: raft-kv-store
+
+# Raft configuration
+raft:
+  group-id: kv-store-group
+  node-id: 127.0.0.1:8081:0
+  endpoint: 127.0.0.1:8081
+  port: 8081
+  peers: 127.0.0.1:8081,127.0.0.1:8082,127.0.0.1:8083
+  data-dir: ./data/node1
+  initializer: true
+  read-timeout: 3000
+  write-timeout: 3000
+
+logging:
+  level:
+    com.raftkv: DEBUG
+    com.alipay.sofa.jraft: INFO

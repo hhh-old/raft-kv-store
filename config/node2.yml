@@ -1,0 +1,22 @@
+server:
+  port: 9082
+
+spring:
+  application:
+    name: raft-kv-store-node2
+
+raft:
+  group-id: kv-store-group
+  node-id: 127.0.0.1:8082:0
+  endpoint: 127.0.0.1:8082
+  port: 8082
+  peers: 127.0.0.1:8081,127.0.0.1:8082,127.0.0.1:8083
+  data-dir: ./data/node2
+  initializer: false
+  read-timeout: 3000
+  write-timeout: 3000
+
+logging:
+  level:
+    com.raftkv: DEBUG
+    com.alipay.sofa.jraft: INFO
