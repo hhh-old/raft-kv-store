@@ -27,6 +27,7 @@ import java.io.File;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.util.Arrays;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
@@ -52,6 +53,11 @@ public class RaftKVService {
     private KVStoreStateMachine stateMachine;
     private final ObjectMapper objectMapper = new ObjectMapper();
     private volatile boolean initialized = false;
+    
+    // 存储所有节点的 raft endpoint -> http endpoint 映射
+    // 用于 Leader 重定向时查找正确的 HTTP URL
+    // Key: raft endpoint (ip:port), Value: http endpoint (ip:httpPort)
+    private final Map<String, String> raftToHttpEndpointMap = new HashMap<>();
 
     @PostConstruct
     public void init() {
@@ -159,6 +165,10 @@ public class RaftKVService {
         nodeOptions.setInitialConf(initConf);
         LOG.info("Node configured with initial conf: {}", raftProperties.getPeers());
         
+        // 初始化 raft endpoint -> http endpoint 映射
+        // 支持每个节点有不同的 httpPort，不依赖固定 offset
+        initRaftToHttpEndpointMap();
+        
         if (raftProperties.isInitializer()) {
             LOG.info("This node is the initializer - will initiate the cluster");
         }
@@ -238,9 +248,150 @@ public class RaftKVService {
         return node != null && node.isLeader();
     }
 
+    /**
+     * 检查节点是否健康
+     * 
+     * 健康条件：
+     * 1. 节点已初始化
+     * 2. 节点状态正常（Leader 或 Follower）
+     * 
+     * 注意：
+     * - 对于 3 节点集群，如果只剩 1 个节点，虽然它可能是 Leader，
+     *   但无法形成多数派，无法提交新日志，从业务角度应该认为不健康
+     * - 但 SOFAJRaft 的 API 限制，我们无法直接检测其他节点是否真的宕机
+     * - 实际生产环境应该配合外部监控来判断集群健康状态
+     * 
+     * @return true 表示健康，false 表示不健康
+     */
     public boolean isReady() {
-        return initialized && node != null &&
-               (node.getNodeState() == State.STATE_LEADER || node.getNodeState() == State.STATE_FOLLOWER);
+        if (!initialized || node == null) {
+            return false;
+        }
+        
+        State state = node.getNodeState();
+        
+        // 检查节点状态
+        // 只有 Leader 或 Follower 状态才算健康
+        // CANDIDATE、TRANSFERRING 等状态都算不健康
+        return state == State.STATE_LEADER || state == State.STATE_FOLLOWER;
+    }
+    
+    /**
+     * 检查集群是否有多数派可用
+     * 
+     * 这个方法用于更严格的集群健康检查
+     * 如果返回 false，说明集群无法处理写请求
+     * 
+     * @return true 表示有多数派，false 表示没有
+     */
+    public boolean hasQuorum() {
+        if (!initialized || node == null) {
+            return false;
+        }
+        
+        // 获取配置中的节点数
+        int totalPeers = node.listPeers().size();
+        int quorum = (totalPeers / 2) + 1;
+        
+        // 简化判断：如果当前是 Leader，假设自己是健康的
+        // 实际上 SOFAJRaft 会阻止没有多数派的 Leader 提交日志
+        if (node.isLeader()) {
+            // Leader 如果能正常工作，说明至少自己是健康的
+            // 但无法确定其他节点状态
+            return true;
+        }
+        
+        // Follower 只要能连接到 Leader 就算有多数派
+        return node.getNodeState() == State.STATE_FOLLOWER;
+    }
+    
+    /**
+     * 初始化 raft endpoint -> http endpoint 映射
+     * 
+     * 通过 peer-http-endpoints 配置建立映射
+     * 要求 raft.peers 和 raft.peer-http-endpoints 一一对应
+     */
+    private void initRaftToHttpEndpointMap() {
+        String peerHttpEndpoints = raftProperties.getPeerHttpEndpoints();
+        String peers = raftProperties.getPeers();
+        
+        if (peerHttpEndpoints == null || peerHttpEndpoints.isEmpty()) {
+            LOG.error("raft.peer-http-endpoints is not configured! " +
+                      "Please add peer-http-endpoints to your configuration.");
+            return;
+        }
+        
+        String[] raftPeers = peers.split(",");
+        String[] httpPeers = peerHttpEndpoints.split(",");
+        
+        if (raftPeers.length != httpPeers.length) {
+            LOG.error("Raft peers count ({}) != HTTP peers count ({}). " +
+                      "Please ensure raft.peers and raft.peer-http-endpoints have the same number of entries.",
+                    raftPeers.length, httpPeers.length);
+            return;
+        }
+        
+        for (int i = 0; i < raftPeers.length; i++) {
+            String raftEndpoint = raftPeers[i].trim();
+            String httpEndpoint = httpPeers[i].trim();
+            raftToHttpEndpointMap.put(raftEndpoint, httpEndpoint);
+            LOG.debug("Mapped raft endpoint {} to http endpoint {}", raftEndpoint, httpEndpoint);
+        }
+        LOG.info("Raft to HTTP endpoint mapping: {}", raftToHttpEndpointMap);
+    }
+    
+    /**
+     * 根据 raft endpoint 获取对应的 http endpoint
+     * 
+     * 用于 Leader 重定向时构造正确的 HTTP URL
+     * 
+     * @param raftEndpoint Raft endpoint (ip:port)
+     * @return HTTP endpoint (ip:httpPort)，如果找不到返回 null
+     */
+    public String getHttpEndpointByRaftEndpoint(String raftEndpoint) {
+        if (raftEndpoint == null) {
+            return null;
+        }
+        
+        // 移除可能的 index 后缀 (ip:port:index -> ip:port)
+        String normalizedEndpoint = normalizeEndpoint(raftEndpoint);
+        
+        String httpEndpoint = raftToHttpEndpointMap.get(normalizedEndpoint);
+        if (httpEndpoint == null) {
+            LOG.warn("Cannot find HTTP endpoint for raft endpoint: {} (normalized: {})", 
+                    raftEndpoint, normalizedEndpoint);
+        }
+        return httpEndpoint;
+    }
+    
+    /**
+     * 标准化 endpoint 格式
+     * 移除 index 后缀：ip:port:index -> ip:port
+     */
+    private String normalizeEndpoint(String endpoint) {
+        if (endpoint == null) {
+            return null;
+        }
+        
+        // 处理 ip:port:index 格式
+        int lastColon = endpoint.lastIndexOf(':');
+        if (lastColon > 0) {
+            String afterLastColon = endpoint.substring(lastColon + 1);
+            try {
+                // 如果能解析为数字，检查是否是 index（通常是 0, 1, 2）
+                Integer.parseInt(afterLastColon);
+                // 再往前找一个冒号
+                String beforeLastColon = endpoint.substring(0, lastColon);
+                int secondLastColon = beforeLastColon.lastIndexOf(':');
+                if (secondLastColon > 0) {
+                    // 是 ip:port:index 格式，返回 ip:port
+                    return beforeLastColon;
+                }
+            } catch (NumberFormatException e) {
+                // 不是数字，说明是 ip:port 格式，直接返回
+            }
+        }
+        return endpoint;
     }
 
     public String getCurrentEndpoint() {

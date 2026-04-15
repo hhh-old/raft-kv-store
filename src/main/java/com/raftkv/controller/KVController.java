@@ -30,6 +30,9 @@ public class KVController {
     /**
      * 获取 Leader 的 HTTP URL
      * 用于非 Leader 节点重定向请求
+     * 
+     * 通过 raft.peer-http-endpoints 配置查找 Leader 的 HTTP 地址
+     * 支持每个节点有不同的 httpPort
      */
     private String getLeaderHttpUrl() {
         String leaderEndpoint = raftKVService.getLeaderEndpoint();
@@ -37,21 +40,16 @@ public class KVController {
             return null;
         }
         
-        // 解析 leader endpoint (格式: ip:port:index 或 ip:port)
-        // 需要转换为 HTTP URL (ip:httpPort)
-        int lastColon = leaderEndpoint.lastIndexOf(':');
-        if (lastColon > 0) {
-            String leaderIp = leaderEndpoint.substring(0, lastColon);
-            try {
-                int leaderRaftPort = Integer.parseInt(leaderEndpoint.substring(lastColon + 1));
-                // HTTP port = raft port + offset (假设 offset 为 1000，根据配置调整)
-                int leaderHttpPort = leaderRaftPort + 1000;
-                return leaderIp + ":" + leaderHttpPort;
-            } catch (NumberFormatException e) {
-                log.warn("Failed to parse leader endpoint: {}", leaderEndpoint);
-            }
+        // 直接通过映射查找 HTTP endpoint
+        String httpEndpoint = raftKVService.getHttpEndpointByRaftEndpoint(leaderEndpoint);
+        if (httpEndpoint != null) {
+            return httpEndpoint;
         }
-        return leaderEndpoint;
+        
+        // 如果找不到映射，返回 null（由调用方处理）
+        log.error("Cannot find HTTP endpoint mapping for leader: {}. " +
+                  "Please check raft.peer-http-endpoints configuration.", leaderEndpoint);
+        return null;
     }
 
     /**

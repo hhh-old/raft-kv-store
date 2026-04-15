@@ -6,17 +6,21 @@ spring:
     name: raft-kv-store-node1
 
 raft:
-  group-id: kv-store-group
-  node-id: 127.0.0.1:8081:0
-  endpoint: 127.0.0.1:8081
-  port: 8081
-  http-port: 9081
+  # 节点标识 (ip:port)
+  node-id: 127.0.0.1:8081
+  
+  # HTTP 端口从 server.port 读取
+  http-port: ${server.port}
+  
+  # 集群配置
   peers: 127.0.0.1:8081,127.0.0.1:8082,127.0.0.1:8083
+  peer-http-endpoints: 127.0.0.1:9081,127.0.0.1:9082,127.0.0.1:9083
+  
+  # 数据目录
   data-dir: D:/project/Claudecode/raft-kv-store/data/node1
+  
+  # 是否为初始节点
   initializer: true
-  read-timeout: 5000
-  write-timeout: 5000
-  election-timeout-ms: 1000  # 选举超时，本地开发建议 1000ms，生产环境建议 150-300ms
 
 logging:
   level:

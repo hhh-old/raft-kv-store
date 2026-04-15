@@ -6,17 +6,12 @@ spring:
     name: raft-kv-store-node2
 
 raft:
-  group-id: kv-store-group
-  node-id: 127.0.0.1:8082:0
-  endpoint: 127.0.0.1:8082
-  port: 8082
-  http-port: 9082
+  node-id: 127.0.0.1:8082
+  http-port: ${server.port}
   peers: 127.0.0.1:8081,127.0.0.1:8082,127.0.0.1:8083
+  peer-http-endpoints: 127.0.0.1:9081,127.0.0.1:9082,127.0.0.1:9083
   data-dir: D:/project/Claudecode/raft-kv-store/data/node2
-  initializer: true
-  read-timeout: 5000
-  write-timeout: 5000
-  election-timeout-ms: 1000  # 选举超时，本地开发建议 1000ms，生产环境建议 150-300ms
+  initializer: false
 
 logging:
   level:
