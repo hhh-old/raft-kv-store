@@ -148,6 +148,21 @@ public class RaftKVService {
         // 快照是状态机在某个日志索引处的完整数据快照
         // 作用：避免节点重启后需要从头回放所有日志，加速恢复过程
         nodeOptions.setSnapshotUri(raftProperties.getDataDir() + File.separator + "snapshot");
+        
+        // 配置快照触发参数，防止 Raft 日志无限增长
+        // 
+        // snapshotLogIndexMargin: 每积累多少条日志触发一次快照
+        // - 默认 0（不基于日志数量触发）
+        // - 建议值：10000（每 1 万条日志触发一次快照）
+        // 
+        // snapshotIntervalSecs: 每隔多少秒触发一次快照
+        // - 默认 3600（1小时）
+        // - 建议值：3600（1小时）或 7200（2小时）
+        //
+        // 触发条件：满足任一条件即触发
+        // 快照生成后，Raft 会自动清理已被快照的日志，释放磁盘空间
+        nodeOptions.setSnapshotLogIndexMargin(raftProperties.getSnapshotLogIndexMargin());
+        nodeOptions.setSnapshotIntervalSecs(raftProperties.getSnapshotIntervalSecs());
 
         // 所有节点都需要设置初始集群配置
         // initializer 节点会基于这个配置发起第一次选举

@@ -82,6 +82,27 @@ public class RaftProperties {
      */
     private int electionTimeoutMs = 1000;
 
+    /**
+     * 快照触发间隔（日志条数）
+     * 每积累多少条日志触发一次快照
+     * - 0: 不基于日志数量触发（默认）
+     * - 建议值：10000（每 1 万条日志触发一次）
+     * 
+     * 与 snapshotIntervalSecs 任一条件满足即触发快照
+     * 快照生成后，Raft 会自动清理已被快照的日志
+     */
+    private int snapshotLogIndexMargin = 10000;
+
+    /**
+     * 快照触发间隔（秒）
+     * 每隔多少秒触发一次快照
+     * - 默认：3600（1小时）
+     * - 建议值：3600 或 7200
+     * 
+     * 与 snapshotLogIndexMargin 任一条件满足即触发快照
+     */
+    private int snapshotIntervalSecs = 3600;
+
     // === 以下字段由配置自动推导，不需要在配置文件中指定 ===
     
     /**
