@@ -10,11 +10,12 @@ raft:
   node-id: 127.0.0.1:8083:0
   endpoint: 127.0.0.1:8083
   port: 8083
+  http-port: 9083
   peers: 127.0.0.1:8081,127.0.0.1:8082,127.0.0.1:8083
   data-dir: D:/project/Claudecode/raft-kv-store/data/node3
   initializer: true
-  read-timeout: 3000
-  write-timeout: 3000
+  read-timeout: 5000
+  write-timeout: 5000
 
 logging:
   level:

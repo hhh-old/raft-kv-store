@@ -271,6 +271,13 @@ public class KVStoreStateMachine extends StateMachineAdapter {
         while (iterator.hasNext()) {
             // 获取当前日志的索引位置
             long index = iterator.getIndex();
+
+            // 【修复关键 1】获取当前日志条目绑定的回调 Closure
+            // 注意：对于 Leader，这个 done 就是你 RaftKVService 里 new 出来的那个 Closure
+            // 对于 Follower（通过网络同步日志的节点），这个 done 是 null
+            Closure done = iterator.done();
+
+
             try {
                 // 获取日志数据（ByteBuffer 格式）
                 ByteBuffer dataBuffer = iterator.getData();
@@ -297,8 +304,18 @@ public class KVStoreStateMachine extends StateMachineAdapter {
                         }
                     }
                 }
+                // 【修复关键 2】执行成功后，必须调用 done.run()！
+                // 这行代码会触发 RaftKVService 中 Closure 的 run 方法，进而执行 latch.countDown()
+                if (done != null) {
+                    done.run(Status.OK());
+                }
             } catch (Exception e) {
                 LOG.error("Failed to apply task at index {}: {}", index, e.getMessage(), e);
+                // 【修复关键 3】即使发生异常，也要通过回调告诉调用方失败了，不要让它死等
+                if (done != null) {
+                    done.run(new Status(-1, "Failed to apply task: " + e.getMessage()));
+                }
+
             } finally {
                 // 必须调用 next() 移动到下一条日志
                 // 如果不调用 next()，Raft 会认为这条日志没有被应用

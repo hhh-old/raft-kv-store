@@ -48,6 +48,11 @@ public class RaftProperties {
     private int port;
 
     /**
+     * HTTP port for client API (REST)
+     */
+    private int httpPort;
+
+    /**
      * Read timeout in milliseconds
      */
     private int readTimeout = 3000;

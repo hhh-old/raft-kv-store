@@ -12,14 +12,16 @@ public class ClientExample {
 
     public static void main(String[] args) {
         // 1. 创建客户端
+        // 注意：客户端超时时间必须大于服务端 write-timeout（5000ms）
+        // 设置为 8 秒，给网络传输和 Raft 日志复制留出足够余量
         RaftKVClient client = RaftKVClient.builder()
                 .serverUrls(Arrays.asList(
-                        "http://localhost:9081",
-                        "http://localhost:9082",
-                        "http://localhost:9083"
+                        "http://127.0.0.1:9081",
+                        "http://127.0.0.1:9082",
+                        "http://127.0.0.1:9083"
                 ))
                 .maxRetries(3)
-                .timeoutSeconds(3)
+                .timeoutSeconds(8)
                 .build();
 
         System.out.println("=== Raft KV Client 示例 ===\n");

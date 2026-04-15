@@ -206,24 +206,27 @@ public class RaftKVClient {
 
         for (int attempt = 1; attempt <= maxRetries; attempt++) {
             try {
+                log.debug("Attempt {} to {} using leader: {}", attempt, operation, currentLeader.get());
                 KVResponse response = executor.execute();
+                log.debug("Response: success={}, error={}, leaderUrl={}, isNotLeader={}",
+                    response.isSuccess(), response.getError(), response.getLeaderUrl(), response.isNotLeader());
 
-                // 检查是否需要重定向到 Leader
-                if (response.isNotLeader() && response.getLeaderUrl() != null) {
+                // 处理重定向循环：直到不是重定向为止
+                while (response.isNotLeader() && response.getLeaderUrl() != null) {
                     log.info("Redirecting to Leader: {}", response.getLeaderUrl());
                     currentLeader.set(response.getLeaderUrl());
-                    
-                    // 立即重试（不等待）
+                    log.debug("Updated leader, retrying with: {}", currentLeader.get());
                     response = executor.execute();
+                    log.debug("After redirect - Response: success={}, error={}, isNotLeader={}",
+                        response.isSuccess(), response.getError(), response.isNotLeader());
                 }
 
-                // 成功或失败都返回
+                // 此时 response 不是重定向
                 if (response.isSuccess()) {
                     log.debug("{} successful: requestId={}", operation, response.getRequestId());
                 } else {
                     log.warn("{} failed: error={}", operation, response.getError());
                 }
-
                 return response;
 
             } catch (Exception e) {
@@ -231,6 +234,12 @@ public class RaftKVClient {
                 log.warn("{} attempt {} failed: {}", operation, attempt, e.getMessage());
 
                 if (attempt < maxRetries) {
+                    // 如果是超时且这是第一次尝试，不等待立即重试
+                    // 原因：首次请求可能因为网络连接初始化而超时，实际服务端可能已处理成功
+                    if (attempt == 1 && e instanceof java.net.http.HttpTimeoutException) {
+                        log.debug("Timeout on first attempt, retrying immediately without waiting...");
+                        continue;
+                    }
                     // 指数退避
                     long waitTime = (long) Math.pow(2, attempt - 1) * 100;
                     log.debug("Waiting {}ms before retry...", waitTime);
@@ -251,6 +260,7 @@ public class RaftKVClient {
      * 执行 HTTP 请求
      */
     private KVResponse executeRequest(String url, String method, Map<String, Object> body) throws Exception {
+        log.debug("Sending {} request to: {}", method, url);
         HttpRequest.Builder requestBuilder = HttpRequest.newBuilder()
                 .uri(URI.create(url))
                 .timeout(Duration.ofSeconds(timeoutSeconds))

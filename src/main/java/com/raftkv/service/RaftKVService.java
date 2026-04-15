@@ -111,9 +111,9 @@ public class RaftKVService {
         
         // 设置选举超时时间（毫秒）
         // Raft 协议中，Follower 在选举超时时间内没收到 Leader 的心跳就会发起选举
-        // 这里设置为 10 秒，实际应用中通常为 150-300ms
+        // 生产环境通常为 150-300ms，本地开发环境设置为 1 秒（1000ms）
         // SOFAJRaft 会自动在 [electionTimeout, 2*electionTimeout] 范围内随机选择，避免多节点同时竞选
-        nodeOptions.setElectionTimeoutMs(10000);
+        nodeOptions.setElectionTimeoutMs(300);
         
         // 是否禁用 CLI 服务（CLI 用于运行时动态修改集群配置，如添加/移除节点）
         // false 表示启用 CLI 服务，允许通过命令行工具动态管理集群
@@ -467,7 +467,7 @@ public class RaftKVService {
         // 1. 检查当前节点是否是 Leader
         // 如果不是 Leader，返回 Leader 信息让客户端重定向
         if (!isLeader()) {
-            String leader = getLeaderEndpoint();
+            String leader = getLeaderHttpUrl();
             if (leader != null) {
                 return KVResponse.builder()
                         .success(false)
@@ -572,8 +572,31 @@ public class RaftKVService {
                 .build();
     }
 
-    private KVResponse redirectToLeader(String key, String value) {
+    private String getLeaderHttpUrl() {
         String leader = getLeaderEndpoint();
+        if (leader == null) {
+            return null;
+        }
+
+        // Calculate offset: all nodes use the same http-port = raft-port + offset
+        int offset = raftProperties.getHttpPort() - raftProperties.getPort();
+
+        // Parse leader's raft port (format: ip:port or ip:port:index)
+        int lastColon = leader.lastIndexOf(':');
+        if (lastColon > 0) {
+            String leaderIp = leader.substring(0, lastColon);
+            try {
+                int leaderRaftPort = Integer.parseInt(leader.substring(lastColon + 1));
+                return leaderIp + ":" + (leaderRaftPort + offset);
+            } catch (NumberFormatException e) {
+                LOG.warn("Failed to parse raft port from leader endpoint: {}", leader);
+            }
+        }
+        return leader;
+    }
+
+    private KVResponse redirectToLeader(String key, String value) {
+        String leader = getLeaderHttpUrl();
         return KVResponse.builder()
                 .success(false)
                 .error("NOT_LEADER")
@@ -584,7 +607,7 @@ public class RaftKVService {
     }
 
     private KVResponse redirectToLeaderForDelete(String key) {
-        String leader = getLeaderEndpoint();
+        String leader = getLeaderHttpUrl();
         return KVResponse.builder()
                 .success(false)
                 .error("NOT_LEADER")
