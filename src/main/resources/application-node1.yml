@@ -16,6 +16,7 @@ raft:
   initializer: true
   read-timeout: 5000
   write-timeout: 5000
+  election-timeout-ms: 1000  # 选举超时，本地开发建议 1000ms，生产环境建议 150-300ms
 
 logging:
   level:

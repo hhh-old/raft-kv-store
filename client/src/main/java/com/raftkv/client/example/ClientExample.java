@@ -4,6 +4,7 @@ import com.raftkv.client.RaftKVClient;
 import com.raftkv.client.entity.KVResponse;
 
 import java.util.Arrays;
+import java.util.Map;
 
 /**
  * Raft KV Client 使用示例
@@ -94,8 +95,22 @@ public class ClientExample {
             }
             System.out.println();
 
-            // 12. 获取集群统计信息
-            System.out.println("[11] 集群统计信息");
+            // 12. GET ALL 操作（获取所有键值对）
+            System.out.println("[11] GET ALL 操作（获取所有键值对）");
+            System.out.println("说明：getAll 使用 ReadIndex 保证线性一致性");
+            System.out.println("      只有 Leader 能处理此请求，Follower 会自动重定向到 Leader");
+            Map<String, String> allData = client.getAll();
+            System.out.println("所有数据:");
+            if (allData != null && !allData.isEmpty()) {
+                allData.forEach((k, v) -> System.out.println("  " + k + " = " + v));
+            } else {
+                System.out.println("  (空)");
+            }
+            System.out.println("总计: " + (allData != null ? allData.size() : 0) + " 条记录");
+            System.out.println();
+
+            // 13. 获取集群统计信息
+            System.out.println("[12] 集群统计信息");
             String stats = client.getStats();
             System.out.println(stats);
             System.out.println();

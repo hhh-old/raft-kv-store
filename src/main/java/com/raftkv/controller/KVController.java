@@ -26,6 +26,33 @@ public class KVController {
 
     @Autowired
     private RaftKVService raftKVService;
+    
+    /**
+     * 获取 Leader 的 HTTP URL
+     * 用于非 Leader 节点重定向请求
+     */
+    private String getLeaderHttpUrl() {
+        String leaderEndpoint = raftKVService.getLeaderEndpoint();
+        if (leaderEndpoint == null) {
+            return null;
+        }
+        
+        // 解析 leader endpoint (格式: ip:port:index 或 ip:port)
+        // 需要转换为 HTTP URL (ip:httpPort)
+        int lastColon = leaderEndpoint.lastIndexOf(':');
+        if (lastColon > 0) {
+            String leaderIp = leaderEndpoint.substring(0, lastColon);
+            try {
+                int leaderRaftPort = Integer.parseInt(leaderEndpoint.substring(lastColon + 1));
+                // HTTP port = raft port + offset (假设 offset 为 1000，根据配置调整)
+                int leaderHttpPort = leaderRaftPort + 1000;
+                return leaderIp + ":" + leaderHttpPort;
+            } catch (NumberFormatException e) {
+                log.warn("Failed to parse leader endpoint: {}", leaderEndpoint);
+            }
+        }
+        return leaderEndpoint;
+    }
 
     /**
      * PUT a key-value pair（支持幂等）
@@ -111,11 +138,28 @@ public class KVController {
     /**
      * GET all key-value pairs (admin endpoint)
      *
+     * 使用线性一致性读：只有 Leader 能处理此请求
+     * 非 Leader 节点会返回 301 重定向到 Leader
+     *
      * @return All key-value pairs
      */
     @GetMapping("/all")
-    public ResponseEntity<Map<String, String>> getAll() {
-        return ResponseEntity.ok(raftKVService.getAll());
+    public ResponseEntity<?> getAll() {
+        Map<String, String> result = raftKVService.getAll();
+        
+        // 如果返回 null，说明当前不是 Leader，需要重定向
+        if (result == null) {
+            String leader = getLeaderHttpUrl();
+            if (leader != null) {
+                return ResponseEntity.status(301)
+                        .header("Location", "http://" + leader + "/kv/all")
+                        .body("{\"error\":\"NOT_LEADER\",\"leaderEndpoint\":\"" + leader + "\"}");
+            }
+            return ResponseEntity.status(503)
+                    .body("{\"error\":\"NO_LEADER_AVAILABLE\"}");
+        }
+        
+        return ResponseEntity.ok(result);
     }
 
     /**

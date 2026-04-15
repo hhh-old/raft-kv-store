@@ -61,4 +61,12 @@ public class RaftProperties {
      * Write timeout in milliseconds
      */
     private int writeTimeout = 3000;
+
+    /**
+     * Election timeout in milliseconds
+     * Raft election timeout, follower will start election if no heartbeat received within this time
+     * Default: 1000ms for local development
+     * Production: 150-300ms
+     */
+    private int electionTimeoutMs = 1000;
 }

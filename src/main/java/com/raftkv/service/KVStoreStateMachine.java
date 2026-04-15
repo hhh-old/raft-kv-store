@@ -20,6 +20,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicLong;
@@ -56,19 +57,35 @@ public class KVStoreStateMachine extends StateMachineAdapter {
      * Key: requestId
      * Value: 操作结果（KVResponse）
      * 
-     * 使用 ConcurrentHashMap 保证线程安全
+     * 使用 LinkedHashMap 实现 LRU 淘汰策略：
+     * - 当缓存满时，自动淘汰最久未使用的请求
+     * - 避免简单清空导致的有效缓存丢失
+     * - 访问顺序（accessOrder=true）保证最近使用的在前面
+     * 
+     * 注意：虽然 LinkedHashMap 不是线程安全的，但 onApply 方法由 Raft 保证单线程调用，
+     * 且幂等检查在 Leader 端完成，所以是安全的。
      */
-    private final Map<String, KVResponse> processedRequests = new ConcurrentHashMap<>();
+    private final Map<String, KVResponse> processedRequests = new LinkedHashMap<String, KVResponse>(16, 0.75f, true) {
+        @Override
+        protected boolean removeEldestEntry(Map.Entry<String, KVResponse> eldest) {
+            // 当缓存大小超过限制时，自动淘汰最老的条目
+            return size() > MAX_CACHE_SIZE;
+        }
+    };
     
     /**
      * 请求缓存的最大大小（防止内存溢出）
-     * 超过这个大小后会清空缓存（简化实现）
+     * 使用 LRU 策略：超过限制时自动淘汰最久未使用的请求
      */
     private static final int MAX_CACHE_SIZE = 10000;
     
     // 持久化文件路径
     // 每次 apply 操作后，会将数据保存到这个文件
     private final String dataFilePath;
+    
+    // 幂等请求缓存的持久化文件路径
+    // 用于节点重启后恢复已处理请求的缓存，保证幂等性
+    private final String requestCacheFilePath;
     
     // 当前任期号（term）
     // term 是 Raft 协议中的逻辑时钟，用于检测过时的信息
@@ -92,6 +109,7 @@ public class KVStoreStateMachine extends StateMachineAdapter {
 
     public KVStoreStateMachine(String dataDir) {
         this.dataFilePath = dataDir + File.separator + "kv-store-data.json";
+        this.requestCacheFilePath = dataDir + File.separator + "request-cache.json";
         Path dataPath = Paths.get(dataDir);
         try {
             Files.createDirectories(dataPath);
@@ -99,6 +117,7 @@ public class KVStoreStateMachine extends StateMachineAdapter {
             LOG.error("Failed to create data directory: {}", dataDir, e);
         }
         loadData();
+        loadRequestCache();
     }
 
     private void loadData() {
@@ -128,6 +147,70 @@ public class KVStoreStateMachine extends StateMachineAdapter {
             }
         } catch (IOException e) {
             LOG.error("Failed to save data file", e);
+        }
+    }
+
+    /**
+     * 加载幂等请求缓存
+     * 
+     * 节点重启时从磁盘恢复已处理请求的缓存，保证幂等性在重启后仍然有效。
+     * 这是幂等性持久化的关键：即使节点重启，也能识别重复请求。
+     */
+    @SuppressWarnings("unchecked")
+    private void loadRequestCache() {
+        Path cacheFile = Paths.get(requestCacheFilePath);
+        if (Files.exists(cacheFile)) {
+            try (BufferedReader reader = Files.newBufferedReader(cacheFile, StandardCharsets.UTF_8)) {
+                StringBuilder content = new StringBuilder();
+                String line;
+                while ((line = reader.readLine()) != null) {
+                    content.append(line);
+                }
+                
+                // 反序列化缓存数据
+                Map<String, Object> cacheData = objectMapper.readValue(content.toString(), Map.class);
+                
+                // 恢复 processedRequests
+                Map<String, Object> requests = (Map<String, Object>) cacheData.get("processedRequests");
+                if (requests != null) {
+                    for (Map.Entry<String, Object> entry : requests.entrySet()) {
+                        // 将 Map 转换回 KVResponse
+                        Object value = entry.getValue();
+                        if (value instanceof Map) {
+                            Map<String, Object> responseMap = (Map<String, Object>) value;
+                            KVResponse response = new KVResponse();
+                            response.setSuccess((Boolean) responseMap.getOrDefault("success", false));
+                            response.setKey((String) responseMap.get("key"));
+                            response.setValue((String) responseMap.get("value"));
+                            response.setRequestId((String) responseMap.get("requestId"));
+                            response.setError((String) responseMap.get("error"));
+                            response.setLeaderEndpoint((String) responseMap.get("leaderEndpoint"));
+                            response.setServedBy((String) responseMap.get("servedBy"));
+                            processedRequests.put(entry.getKey(), response);
+                        }
+                    }
+                    LOG.info("Loaded {} cached requests from disk", processedRequests.size());
+                }
+            } catch (IOException e) {
+                LOG.warn("Failed to load request cache, starting fresh: {}", e.getMessage());
+            }
+        }
+    }
+
+    /**
+     * 保存幂等请求缓存到磁盘
+     * 
+     * 每次 apply 操作后，将已处理请求的缓存持久化到磁盘。
+     * 这样即使节点崩溃或重启，也能保证幂等性。
+     */
+    private void saveRequestCache() {
+        try (BufferedWriter writer = Files.newBufferedWriter(Paths.get(requestCacheFilePath), StandardCharsets.UTF_8)) {
+            Map<String, Object> cacheData = new HashMap<>();
+            cacheData.put("processedRequests", processedRequests);
+            cacheData.put("timestamp", System.currentTimeMillis());
+            objectMapper.writeValue(writer, cacheData);
+        } catch (IOException e) {
+            LOG.error("Failed to save request cache", e);
         }
     }
 
@@ -164,6 +247,9 @@ public class KVStoreStateMachine extends StateMachineAdapter {
     /**
      * 检查是否是重复请求（幂等去重）
      * 
+     * 使用 LRU 缓存检查请求是否已处理。
+     * 由于使用了 LinkedHashMap，访问已存在的 key 会更新其访问顺序。
+     * 
      * @param requestId 请求 ID
      * @return true 表示已处理过，false 表示新请求
      */
@@ -171,11 +257,16 @@ public class KVStoreStateMachine extends StateMachineAdapter {
         if (requestId == null || requestId.isEmpty()) {
             return false;  // 没有 requestId，视为新请求
         }
-        return processedRequests.containsKey(requestId);
+        synchronized (processedRequests) {
+            return processedRequests.containsKey(requestId);
+        }
     }
 
     /**
      * 缓存操作结果（用于幂等返回）
+     * 
+     * 使用 LRU 策略：当缓存满时，自动淘汰最久未使用的请求。
+     * 这样可以在保持内存限制的同时，最大化缓存命中率。
      * 
      * @param task 已处理的任务
      */
@@ -184,11 +275,8 @@ public class KVStoreStateMachine extends StateMachineAdapter {
             return;  // 没有 requestId，不缓存
         }
 
-        // 限制缓存大小，防止内存溢出
-        if (processedRequests.size() > MAX_CACHE_SIZE) {
-            LOG.warn("Request cache size exceeded {}, clearing cache", MAX_CACHE_SIZE);
-            processedRequests.clear();
-        }
+        // LRU 策略：LinkedHashMap 会自动处理淘汰
+        // 当 size() > MAX_CACHE_SIZE 时，removeEldestEntry 返回 true，自动移除最老的条目
 
         // 构建响应对象并缓存
         KVResponse response;
@@ -210,12 +298,17 @@ public class KVStoreStateMachine extends StateMachineAdapter {
             return;  // 未知操作，不缓存
         }
 
-        processedRequests.put(task.getRequestId(), response);
-        LOG.debug("Cached result for requestId: {}", task.getRequestId());
+        synchronized (processedRequests) {
+            processedRequests.put(task.getRequestId(), response);
+        }
+        LOG.debug("Cached result for requestId: {}, cache size: {}", task.getRequestId(), processedRequests.size());
     }
 
     /**
      * 获取已缓存的请求结果（用于幂等返回）
+     * 
+     * 从 LRU 缓存中获取请求结果。
+     * 访问缓存会更新该条目的访问顺序（LinkedHashMap accessOrder=true）。
      * 
      * @param requestId 请求 ID
      * @return 缓存的响应对象，如果不存在则返回 null
@@ -224,7 +317,9 @@ public class KVStoreStateMachine extends StateMachineAdapter {
         if (requestId == null || requestId.isEmpty()) {
             return null;
         }
-        return processedRequests.get(requestId);
+        synchronized (processedRequests) {
+            return processedRequests.get(requestId);
+        }
     }
 
     /**
@@ -326,6 +421,10 @@ public class KVStoreStateMachine extends StateMachineAdapter {
         // 所有日志应用完成后，持久化到磁盘
         // 这样即使节点重启，数据也不会丢失
         saveData();
+        
+        // 持久化幂等请求缓存
+        // 保证节点重启后仍能识别重复请求
+        saveRequestCache();
     }
 
     private void applyTask(KVTask task) {

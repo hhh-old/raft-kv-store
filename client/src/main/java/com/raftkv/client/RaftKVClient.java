@@ -9,10 +9,12 @@ import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.time.Duration;
+import java.util.Arrays;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.stream.Collectors;
 
 /**
  * Raft KV Store 客户端
@@ -178,6 +180,90 @@ public class RaftKVClient {
     }
 
     /**
+     * GET ALL 操作（获取所有键值对）
+     * 
+     * 使用线性一致性读：只有 Leader 能处理此请求
+     * 如果当前节点不是 Leader，会自动重定向到 Leader
+     * 
+     * @return 所有键值对的 Map
+     */
+    public Map<String, String> getAll() {
+        log.debug("GET_ALL request");
+
+        Exception lastException = null;
+
+        for (int attempt = 1; attempt <= maxRetries; attempt++) {
+            try {
+                log.debug("Attempt {} to GET_ALL using leader: {}", attempt, currentLeader.get());
+                String url = getCurrentLeader() + "/kv/all";
+                Map<String, String> result = executeGetAllRequest(url);
+                log.debug("GET_ALL successful");
+                return result;
+
+            } catch (Exception e) {
+                lastException = e;
+                log.warn("GET_ALL attempt {} failed: {}", attempt, e.getMessage());
+
+                // 处理重定向
+                if (e.getMessage() != null && e.getMessage().contains("NOT_LEADER")) {
+                    log.info("Retrying with new leader...");
+                    continue;  // 立即重试，不等待
+                }
+
+                if (attempt < maxRetries) {
+                    // 指数退避
+                    long waitTime = (long) Math.pow(2, attempt - 1) * 100;
+                    log.debug("Waiting {}ms before retry...", waitTime);
+                    try {
+                        Thread.sleep(waitTime);
+                    } catch (InterruptedException ie) {
+                        Thread.currentThread().interrupt();
+                        throw new RuntimeException("Retry interrupted", ie);
+                    }
+                }
+            }
+        }
+
+        throw new RuntimeException("GET_ALL failed after " + maxRetries + " attempts", lastException);
+    }
+
+    /**
+     * 执行 GET ALL 请求
+     */
+    @SuppressWarnings("unchecked")
+    private Map<String, String> executeGetAllRequest(String url) throws Exception {
+        log.debug("Sending GET_ALL request to: {}", url);
+        HttpRequest request = HttpRequest.newBuilder()
+                .uri(URI.create(url))
+                .timeout(Duration.ofSeconds(timeoutSeconds))
+                .header("Accept", "application/json")
+                .GET()
+                .build();
+
+        HttpResponse<String> response = httpClient.send(request, 
+                HttpResponse.BodyHandlers.ofString());
+
+        if (response.statusCode() == 200) {
+            // 解析 JSON 响应为 Map
+            String body = response.body();
+            if (body == null || body.isEmpty() || body.equals("{}")) {
+                return new HashMap<>();
+            }
+            // 使用 ObjectMapper 解析 JSON
+            return objectMapper.readValue(body, Map.class);
+        } else if (response.statusCode() == 301) {
+            // 处理重定向
+            String location = response.headers().firstValue("Location")
+                    .orElseThrow(() -> new RuntimeException("Redirect without Location header"));
+            log.info("GET_ALL redirected to: {}", location);
+            currentLeader.set(location.replace("/kv/all", ""));
+            throw new RuntimeException("NOT_LEADER");
+        } else {
+            throw new RuntimeException("HTTP " + response.statusCode() + ": " + response.body());
+        }
+    }
+
+    /**
      * 获取集群统计信息
      */
     public String getStats() {
@@ -332,7 +418,9 @@ public class RaftKVClient {
     public static class Builder {
         private java.util.List<String> serverUrls;
         private int maxRetries = 3;
-        private int timeoutSeconds = 3;
+        // 客户端超时必须大于服务器 write-timeout (5000ms)
+        // 设置为 8 秒，给网络延迟和重试留出足够时间
+        private int timeoutSeconds = 8;
 
         public Builder serverUrls(java.util.List<String> serverUrls) {
             this.serverUrls = serverUrls;

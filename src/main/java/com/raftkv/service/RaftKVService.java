@@ -111,9 +111,18 @@ public class RaftKVService {
         
         // 设置选举超时时间（毫秒）
         // Raft 协议中，Follower 在选举超时时间内没收到 Leader 的心跳就会发起选举
-        // 生产环境通常为 150-300ms，本地开发环境设置为 1 秒（1000ms）
+        // 
+        // 超时层级设计（本地开发环境）：
+        // - electionTimeout: 1000ms（Leader 选举，可配置）
+        // - heartbeat: ~100ms（由 SOFAJRaft 自动计算 = electionTimeout / 10）
+        // - writeTimeout: 5000ms（客户端写超时）
+        // - clientTimeout: 8000ms（客户端 HTTP 超时）
+        //
+        // 这样设计保证：heartbeat << electionTimeout << writeTimeout << clientTimeout
+        // 避免：1）不必要的 Leader 切换 2）客户端超时先于服务器完成
+        //
         // SOFAJRaft 会自动在 [electionTimeout, 2*electionTimeout] 范围内随机选择，避免多节点同时竞选
-        nodeOptions.setElectionTimeoutMs(300);
+        nodeOptions.setElectionTimeoutMs(raftProperties.getElectionTimeoutMs());
         
         // 是否禁用 CLI 服务（CLI 用于运行时动态修改集群配置，如添加/移除节点）
         // false 表示启用 CLI 服务，允许通过命令行工具动态管理集群
@@ -535,8 +544,67 @@ public class RaftKVService {
         }
     }
 
+    /**
+     * 获取所有键值对（线性一致性读）
+     * 
+     * 使用 ReadIndex 机制保证线性一致性：
+     * 1. 记录当前的 committed index（ReadIndex）
+     * 2. Leader 向 Follower 发送心跳，确认自己仍是 Leader
+     * 3. 收到大多数 Follower 确认后，等待状态机应用到 ReadIndex
+     * 4. 安全地读取状态机数据
+     * 
+     * 注意：与单个 key 的 get 操作不同，getAll 需要读取整个状态机快照
+     * 
+     * @return 所有键值对的副本，如果当前不是 Leader 则返回 null（需要重定向）
+     */
     public Map<String, String> getAll() {
-        return stateMachine.getAll();
+        // 非 Leader 节点返回 null，由 Controller 重定向到 Leader
+        // 这是为了保证线性一致性：只有 Leader 能通过 ReadIndex 确认自己仍是 Leader
+        if (!isLeader()) {
+            LOG.warn("GET_ALL request received on non-leader node, redirecting to leader");
+            return null;
+        }
+
+        // Leader 使用 ReadIndex 保证线性一致性
+        try {
+            CompletableFuture<Map<String, String>> future = new CompletableFuture<>();
+            
+            // 使用特殊标记表示这是 getAll 操作
+            byte[] requestContext = "__GET_ALL__".getBytes(StandardCharsets.UTF_8);
+            
+            node.readIndex(requestContext, new ReadIndexClosure() {
+                @Override
+                public void run(Status status, long index, byte[] reqCtx) {
+                    if (status.isOk()) {
+                        // ReadIndex 成功，状态机已应用到 index，可以安全读取
+                        try {
+                            Map<String, String> allData = stateMachine.getAll();
+                            LOG.debug("ReadIndex GET_ALL successful: {} keys, index={}", 
+                                allData.size(), index);
+                            future.complete(allData);
+                        } catch (Exception e) {
+                            LOG.error("ReadIndex GET_ALL callback error", e);
+                            future.completeExceptionally(e);
+                        }
+                    } else {
+                        // ReadIndex 失败（Leader 可能已经变更）
+                        LOG.warn("ReadIndex GET_ALL failed: {}", status.getErrorMsg());
+                        future.completeExceptionally(
+                            new RuntimeException("Read failed: " + status.getErrorMsg()));
+                    }
+                }
+            });
+            
+            // 等待 ReadIndex 完成
+            return future.get(raftProperties.getReadTimeout(), TimeUnit.MILLISECONDS);
+            
+        } catch (TimeoutException e) {
+            LOG.error("ReadIndex GET_ALL timeout");
+            throw new RuntimeException("GET_ALL timeout", e);
+        } catch (Exception e) {
+            LOG.error("ReadIndex GET_ALL error", e);
+            throw new RuntimeException("GET_ALL failed", e);
+        }
     }
 
     public ClusterStats getClusterStats() {
