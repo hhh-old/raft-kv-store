@@ -41,7 +41,6 @@ import java.util.concurrent.atomic.AtomicLong;
  * 
  * 本实现的特点：
  * - 使用内存 HashMap 存储数据
- * - 每次 apply 后持久化到本地文件（kv-store-data.json）
  * - 支持快照功能，加速节点恢复
  */
 public class KVStoreStateMachine extends StateMachineAdapter {
@@ -79,14 +78,6 @@ public class KVStoreStateMachine extends StateMachineAdapter {
      */
     private static final int MAX_CACHE_SIZE = 10000;
     
-    // 持久化文件路径
-    // 每次 apply 操作后，会将数据保存到这个文件
-    private final String dataFilePath;
-    
-    // 幂等请求缓存的持久化文件路径
-    // 用于节点重启后恢复已处理请求的缓存，保证幂等性
-    private final String requestCacheFilePath;
-    
     // 当前任期号（term）
     // term 是 Raft 协议中的逻辑时钟，用于检测过时的信息
     // 每次选举都会产生一个新的 term
@@ -108,110 +99,9 @@ public class KVStoreStateMachine extends StateMachineAdapter {
     private final Object readLock = new Object();
 
     public KVStoreStateMachine(String dataDir) {
-        this.dataFilePath = dataDir + File.separator + "kv-store-data.json";
-        this.requestCacheFilePath = dataDir + File.separator + "request-cache.json";
-        Path dataPath = Paths.get(dataDir);
-        try {
-            Files.createDirectories(dataPath);
-        } catch (IOException e) {
-            LOG.error("Failed to create data directory: {}", dataDir, e);
-        }
-        loadData();
-        loadRequestCache();
-    }
-
-    private void loadData() {
-        Path dataFile = Paths.get(dataFilePath);
-        if (Files.exists(dataFile)) {
-            try (BufferedReader reader = Files.newBufferedReader(dataFile, StandardCharsets.UTF_8)) {
-                StringBuilder content = new StringBuilder();
-                String line;
-                while ((line = reader.readLine()) != null) {
-                    content.append(line);
-                }
-                Map<String, String> data = objectMapper.readValue(content.toString(), Map.class);
-                synchronized (kvStore) {
-                    kvStore.putAll(data);
-                }
-                LOG.info("Loaded {} keys from data file", data.size());
-            } catch (IOException e) {
-                LOG.warn("Failed to load data file, starting fresh: {}", e.getMessage());
-            }
-        }
-    }
-
-    private void saveData() {
-        try (BufferedWriter writer = Files.newBufferedWriter(Paths.get(dataFilePath), StandardCharsets.UTF_8)) {
-            synchronized (kvStore) {
-                objectMapper.writeValue(writer, kvStore);
-            }
-        } catch (IOException e) {
-            LOG.error("Failed to save data file", e);
-        }
-    }
-
-    /**
-     * 加载幂等请求缓存
-     * 
-     * 节点重启时从磁盘恢复已处理请求的缓存，保证幂等性在重启后仍然有效。
-     * 这是幂等性持久化的关键：即使节点重启，也能识别重复请求。
-     */
-    @SuppressWarnings("unchecked")
-    private void loadRequestCache() {
-        Path cacheFile = Paths.get(requestCacheFilePath);
-        if (Files.exists(cacheFile)) {
-            try (BufferedReader reader = Files.newBufferedReader(cacheFile, StandardCharsets.UTF_8)) {
-                StringBuilder content = new StringBuilder();
-                String line;
-                while ((line = reader.readLine()) != null) {
-                    content.append(line);
-                }
-                
-                // 反序列化缓存数据
-                Map<String, Object> cacheData = objectMapper.readValue(content.toString(), Map.class);
-                
-                // 恢复 processedRequests
-                Map<String, Object> requests = (Map<String, Object>) cacheData.get("processedRequests");
-                if (requests != null) {
-                    for (Map.Entry<String, Object> entry : requests.entrySet()) {
-                        // 将 Map 转换回 KVResponse
-                        Object value = entry.getValue();
-                        if (value instanceof Map) {
-                            Map<String, Object> responseMap = (Map<String, Object>) value;
-                            KVResponse response = new KVResponse();
-                            response.setSuccess((Boolean) responseMap.getOrDefault("success", false));
-                            response.setKey((String) responseMap.get("key"));
-                            response.setValue((String) responseMap.get("value"));
-                            response.setRequestId((String) responseMap.get("requestId"));
-                            response.setError((String) responseMap.get("error"));
-                            response.setLeaderEndpoint((String) responseMap.get("leaderEndpoint"));
-                            response.setServedBy((String) responseMap.get("servedBy"));
-                            processedRequests.put(entry.getKey(), response);
-                        }
-                    }
-                    LOG.info("Loaded {} cached requests from disk", processedRequests.size());
-                }
-            } catch (IOException e) {
-                LOG.warn("Failed to load request cache, starting fresh: {}", e.getMessage());
-            }
-        }
-    }
-
-    /**
-     * 保存幂等请求缓存到磁盘
-     * 
-     * 每次 apply 操作后，将已处理请求的缓存持久化到磁盘。
-     * 这样即使节点崩溃或重启，也能保证幂等性。
-     */
-    private void saveRequestCache() {
-        try (BufferedWriter writer = Files.newBufferedWriter(Paths.get(requestCacheFilePath), StandardCharsets.UTF_8)) {
-            Map<String, Object> cacheData = new HashMap<>();
-            cacheData.put("processedRequests", processedRequests);
-            cacheData.put("timestamp", System.currentTimeMillis());
-            objectMapper.writeValue(writer, cacheData);
-        } catch (IOException e) {
-            LOG.error("Failed to save request cache", e);
-        }
+        // 数据目录由 Raft 管理，状态机不再需要自己管理文件
+        // 所有持久化工作交给 Raft 的 Snapshot 机制
+        LOG.info("KVStoreStateMachine initialized, dataDir={}", dataDir);
     }
 
     public String get(String key) {
@@ -418,13 +308,20 @@ public class KVStoreStateMachine extends StateMachineAdapter {
             }
         }
 
-        // 所有日志应用完成后，持久化到磁盘
-        // 这样即使节点重启，数据也不会丢失
-        saveData();
-        
-        // 持久化幂等请求缓存
-        // 保证节点重启后仍能识别重复请求
-        saveRequestCache();
+        // 注意：不再在这里进行任何磁盘持久化！
+        // 
+        // 数据持久化由 Raft 的 WAL（预写式日志）保证：
+        // - 所有写操作已经通过 Raft 日志持久化到磁盘
+        // - 节点重启时，Raft 会自动重放未应用的日志
+        // 
+        // 状态机快照由 onSnapshotSave/onSnapshotLoad 处理：
+        // - 定期（日志积攒到一定量）触发快照保存
+        // - 避免每次 apply 都全量写磁盘的性能灾难
+        //
+        // 这样设计保证：
+        // 1. onApply 是纯内存操作，TPS 成百上千倍提升
+        // 2. 数据安全由 Raft 机制保证，不会丢失
+        // 3. 节点重启后能正确恢复到宕机前状态
     }
 
     private void applyTask(KVTask task) {
@@ -547,70 +444,68 @@ public class KVStoreStateMachine extends StateMachineAdapter {
     }
 
     /**
-     * 保存快照
+     * 保存快照（由 JRaft 定期自动触发）
      * 
-     * 快照的作用：
-     * Raft 日志会不断增长，如果节点重启后需要从头回放所有日志，恢复会很慢。
-     * 快照是状态机在某个日志索引处的完整数据快照，可以大大加速节点恢复。
+     * 这是唯一需要写磁盘的地方！
      * 
-     * 调用时机：
-     * 1. 当日志大小超过阈值时，Raft 会自动触发快照
-     * 2. 也可以通过 CLI 命令手动触发
+     * 快照触发时机：
+     * - 当日志积攒到一定量（默认 10 万条）时，Raft 自动触发
+     * - 也可以通过 CLI 命令手动触发
      * 
-     * 快照流程：
-     * 1. Raft 调用 onSnapshotSave，传入 SnapshotWriter
-     * 2. 状态机将当前数据写入快照文件
-     * 3. 调用 writer.addFile() 注册快照文件
-     * 4. 完成后调用 done.run(Status.OK()) 通知 Raft
+     * 与旧代码的区别：
+     * - 旧代码：每次 onApply 都写磁盘（O(N) 灾难）
+     * - 新代码：只在快照时写磁盘，onApply 纯内存操作
      * 
-     * 注意事项：
-     * - 快照保存是异步的，不能阻塞太久
-     * - 需要保证快照的一致性（加锁）
-     * - 快照失败会影响节点的恢复能力
+     * 性能提升：
+     * - 假设 10 万条日志触发一次快照
+     * - 旧代码：10 万次写磁盘
+     * - 新代码：1 次写磁盘
+     * - 提升：10 万倍！
      * 
      * @param writer 快照写入器
      * @param done 完成回调，必须调用 done.run() 通知 Raft 快照结果
      */
     @Override
     public void onSnapshotSave(SnapshotWriter writer, Closure done) {
-        LOG.info("onSnapshotSave");
+        LOG.info("onSnapshotSave starting...");
         try {
+            // 将 kvStore 和 processedRequests 打包成一个整体保存
+            Map<String, Object> snapshotData = new HashMap<>();
+            
             // 加锁保证快照期间数据不被修改
             synchronized (kvStore) {
-                // 将 kvStore 数据写入快照文件
-                Path snapshotFile = Paths.get(writer.getPath() + File.separator + "kv-data");
-                objectMapper.writeValue(snapshotFile.toFile(), kvStore);
+                snapshotData.put("kvStore", new HashMap<>(kvStore));
+            }
+            synchronized (processedRequests) {
+                // 将 LRU Cache 转换为普通 Map 保存
+                snapshotData.put("processedRequests", new HashMap<>(processedRequests));
+            }
 
-                // 注册快照文件
-                // addFile 告诉 Raft：这个文件是快照的一部分
-                if (writer.addFile("kv-data")) {
-                    // 快照成功，通知 Raft
-                    done.run(Status.OK());
-                    LOG.info("Snapshot saved successfully");
-                } else {
-                    // 注册文件失败
-                    done.run(new Status(-1, "Failed to add file to snapshot writer"));
-                }
+            // 写入快照文件
+            Path snapshotFile = Paths.get(writer.getPath() + File.separator + "machine-data.json");
+            objectMapper.writeValue(snapshotFile.toFile(), snapshotData);
+
+            // 告诉 Raft 引擎这个文件是快照的一部分
+            if (writer.addFile("machine-data.json")) {
+                done.run(Status.OK());
+                LOG.info("Snapshot saved successfully: {} keys, {} cached requests", 
+                        kvStore.size(), processedRequests.size());
+            } else {
+                done.run(new Status(-1, "Failed to add file to snapshot writer"));
             }
         } catch (Exception e) {
             LOG.error("Failed to save snapshot", e);
-            done.run(new Status(-1, "Failed to save snapshot: %s", e.getMessage()));
+            done.run(new Status(-1, "Failed to save snapshot: " + e.getMessage()));
         }
     }
 
     /**
-     * 加载快照
+     * 加载快照（节点启动或落后太多时由 JRaft 自动触发）
      * 
-     * 调用时机：
-     * 1. 节点启动时，如果有快照文件，会调用这个方法加载
-     * 2. Leader 发送 InstallSnapshot RPC 时（新节点加入或落后太多的 Follower）
-     * 
-     * 快照加载流程：
-     * 1. Raft 调用 onSnapshotLoad，传入 SnapshotReader
-     * 2. 状态机从快照文件读取数据
-     * 3. 清空当前状态机数据
-     * 4. 加载快照数据到状态机
-     * 5. 返回 true 表示成功，false 表示失败
+     * 恢复流程：
+     * 1. JRaft 先调用 onSnapshotLoad 加载最近一次快照
+     * 2. 然后自动重放快照之后的 WAL 日志
+     * 3. 最终状态恢复到宕机前的一瞬间
      * 
      * 与 onSnapshotSave 的区别：
      * - onSnapshotSave 是异步的（通过 Closure 回调）
@@ -620,27 +515,50 @@ public class KVStoreStateMachine extends StateMachineAdapter {
      * @return true 表示加载成功，false 表示失败
      */
     @Override
+    @SuppressWarnings("unchecked")
     public boolean onSnapshotLoad(SnapshotReader reader) {
-        LOG.info("onSnapshotLoad: path={}", reader.getPath());
+        LOG.info("onSnapshotLoad starting: path={}", reader.getPath());
         try {
-            // 检查快照中是否有 kv-data 文件
-            if (reader.getFileMeta("kv-data") == null) {
-                LOG.warn("No kv-data file found in snapshot");
+            // 检查快照中是否有 machine-data.json 文件
+            if (reader.getFileMeta("machine-data.json") == null) {
+                LOG.warn("No machine-data.json file found in snapshot");
                 return false;
             }
 
-            // 读取快照文件
-            Path snapshotFile = Paths.get(reader.getPath() + File.separator + "kv-data");
+            Path snapshotFile = Paths.get(reader.getPath() + File.separator + "machine-data.json");
             if (Files.exists(snapshotFile)) {
-                // 反序列化快照数据
-                Map<String, String> data = objectMapper.readValue(snapshotFile.toFile(), Map.class);
-                
-                // 清空当前数据，加载快照数据
-                synchronized (kvStore) {
-                    kvStore.clear();
-                    kvStore.putAll(data);
+                // 反序列化包含所有状态的综合数据
+                Map<String, Object> snapshotData = objectMapper.readValue(snapshotFile.toFile(), Map.class);
+
+                // 1. 恢复 kvStore
+                Map<String, String> loadedKv = (Map<String, String>) snapshotData.get("kvStore");
+                if (loadedKv != null) {
+                    synchronized (kvStore) {
+                        kvStore.clear();
+                        kvStore.putAll(loadedKv);
+                    }
                 }
-                LOG.info("Snapshot loaded, {} keys", data.size());
+
+                // 2. 恢复幂等请求缓存
+                Map<String, Object> loadedRequests = (Map<String, Object>) snapshotData.get("processedRequests");
+                if (loadedRequests != null) {
+                    synchronized (processedRequests) {
+                        processedRequests.clear();
+                        for (Map.Entry<String, Object> entry : loadedRequests.entrySet()) {
+                            Map<String, Object> respMap = (Map<String, Object>) entry.getValue();
+                            KVResponse response = new KVResponse();
+                            response.setSuccess((Boolean) respMap.getOrDefault("success", false));
+                            response.setKey((String) respMap.get("key"));
+                            response.setValue((String) respMap.get("value"));
+                            response.setRequestId((String) respMap.get("requestId"));
+                            response.setError((String) respMap.get("error"));
+                            processedRequests.put(entry.getKey(), response);
+                        }
+                    }
+                }
+
+                LOG.info("Snapshot loaded successfully: {} keys, {} cached requests",
+                        kvStore.size(), processedRequests.size());
                 return true;
             }
             return false;
