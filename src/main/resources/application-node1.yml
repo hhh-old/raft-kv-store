@@ -8,19 +8,36 @@ spring:
 raft:
   # 节点标识 (ip:port)
   node-id: 127.0.0.1:8081
-  
+
   # HTTP 端口从 server.port 读取
   http-port: ${server.port}
-  
+
   # 集群配置
   peers: 127.0.0.1:8081,127.0.0.1:8082,127.0.0.1:8083
   peer-http-endpoints: 127.0.0.1:9081,127.0.0.1:9082,127.0.0.1:9083
-  
+
   # 数据目录
   data-dir: D:/project/Claudecode/raft-kv-store/data/node1
-  
+
   # 是否为初始节点
   initializer: true
+
+  # 读超时（毫秒）
+  read-timeout: 5000
+
+  # 写超时（毫秒）
+  write-timeout: 5000
+
+  # 选举超时（毫秒）
+  election-timeout-ms: 1000
+
+  # 快照触发间隔（日志条数）
+  # 每积累多少条日志触发一次快照
+  snapshot-log-index-margin: 10000
+
+  # 快照触发间隔（秒）
+  # 每隔多少秒检查并触发快照
+  snapshot-interval-secs: 3600
 
 logging:
   level:

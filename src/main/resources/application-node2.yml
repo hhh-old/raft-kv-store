@@ -13,6 +13,21 @@ raft:
   data-dir: D:/project/Claudecode/raft-kv-store/data/node2
   initializer: false
 
+  # 读超时（毫秒）
+  read-timeout: 5000
+
+  # 写超时（毫秒）
+  write-timeout: 5000
+
+  # 选举超时（毫秒）
+  election-timeout-ms: 1000
+
+  # 快照触发间隔（日志条数）
+  snapshot-log-index-margin: 10000
+
+  # 快照触发间隔（秒）
+  snapshot-interval-secs: 3600
+
 logging:
   level:
     com.raftkv: DEBUG
