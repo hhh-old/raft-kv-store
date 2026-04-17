@@ -47,6 +47,9 @@ public class RaftKVService {
 
     @Autowired
     private RaftProperties raftProperties;
+    
+    @Autowired
+    private WatchManager watchManager;
 
     private RaftGroupService raftGroupService;
     private Node node;
@@ -195,6 +198,9 @@ public class RaftKVService {
         // 3. onLeaderStart/onLeaderStop: 领导权变更通知
         // 状态机保证了所有节点以相同的顺序应用相同的操作，从而实现数据一致性
         stateMachine = new KVStoreStateMachine(raftProperties.getDataDir());
+        
+        // 注入 WatchManager，用于生成 Watch 事件
+        stateMachine.setWatchManager(watchManager);
         
         // 将状态机绑定到 Raft 节点
         // 当 Raft 日志被大多数节点确认后（committed），就会调用 stateMachine.onApply() 应用该日志
@@ -804,6 +810,15 @@ public class RaftKVService {
                 .groupId(raftProperties.getGroupId())
                 .nodeId(node != null ? node.getNodeId().toString() : null)
                 .build();
+    }
+
+    /**
+     * 获取当前全局版本号（用于 Watch 机制）
+     * 
+     * @return 当前 revision，如果状态机未初始化返回 0
+     */
+    public long getCurrentRevision() {
+        return stateMachine != null ? stateMachine.getCurrentRevision() : 0;
     }
 
     private String getLeaderHttpUrl() {

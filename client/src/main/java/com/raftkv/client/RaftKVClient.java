@@ -2,8 +2,11 @@ package com.raftkv.client;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.raftkv.client.entity.KVResponse;
+import com.raftkv.client.entity.WatchEvent;
 import lombok.extern.slf4j.Slf4j;
 
+import java.io.BufferedReader;
+import java.io.InputStreamReader;
 import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
@@ -13,7 +16,10 @@ import java.util.Arrays;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.UUID;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.Consumer;
 import java.util.stream.Collectors;
 
 /**
@@ -58,6 +64,9 @@ public class RaftKVClient {
     
     // 当前已知的 Leader 地址
     private final AtomicReference<String> currentLeader = new AtomicReference<>();
+    
+    // 活跃的 Watch 监听器
+    private final CopyOnWriteArrayList<WatchListener> activeWatches = new CopyOnWriteArrayList<>();
 
     private RaftKVClient(Builder builder) {
         this.serverUrls = builder.serverUrls;
@@ -451,5 +460,309 @@ public class RaftKVClient {
     @FunctionalInterface
     private interface RequestExecutor {
         KVResponse execute() throws Exception;
+    }
+
+    // ==================== Watch 机制 ====================
+
+    /**
+     * 监听指定 Key 的变化
+     * 
+     * @param key 要监听的 Key
+     * @param callback 事件回调函数
+     * @return WatchListener 用于取消监听
+     */
+    public WatchListener watch(String key, Consumer<WatchEvent> callback) {
+        return watch(key, false, 0, callback);
+    }
+
+    /**
+     * 监听指定前缀的所有 Key 变化
+     * 
+     * @param prefix Key 前缀
+     * @param callback 事件回调函数
+     * @return WatchListener 用于取消监听
+     */
+    public WatchListener watchPrefix(String prefix, Consumer<WatchEvent> callback) {
+        return watch(prefix, true, 0, callback);
+    }
+
+    /**
+     * 从历史版本开始监听
+     * 
+     * @param key 要监听的 Key
+     * @param startRevision 起始版本号
+     * @param callback 事件回调函数
+     * @return WatchListener 用于取消监听
+     */
+    public WatchListener watchFromRevision(String key, long startRevision, Consumer<WatchEvent> callback) {
+        return watch(key, false, startRevision, callback);
+    }
+
+    /**
+     * 创建 Watch 订阅（通用方法）
+     * 
+     * @param key Key 或前缀
+     * @param isPrefix 是否为前缀匹配
+     * @param startRevision 起始版本号（0 表示从当前开始）
+     * @param callback 事件回调
+     * @return WatchListener
+     */
+    private WatchListener watch(String key, boolean isPrefix, long startRevision, Consumer<WatchEvent> callback) {
+        log.info("Creating watch: key={}, prefix={}, startRevision={}", key, isPrefix, startRevision);
+
+        try {
+            // 1. 创建 Watch 订阅
+            Map<String, Object> requestBody = new HashMap<>();
+            requestBody.put("key", key);
+            requestBody.put("prefix", isPrefix);
+            requestBody.put("startRevision", startRevision);
+
+            String url = getCurrentLeader() + "/watch";
+            HttpRequest request = HttpRequest.newBuilder()
+                    .uri(URI.create(url))
+                    .timeout(Duration.ofSeconds(timeoutSeconds))
+                    .header("Content-Type", "application/json")
+                    .POST(HttpRequest.BodyPublishers.ofString(objectMapper.writeValueAsString(requestBody)))
+                    .build();
+
+            HttpResponse<String> response = httpClient.send(request, HttpResponse.BodyHandlers.ofString());
+
+            if (response.statusCode() != 200) {
+                throw new RuntimeException("Failed to create watch: " + response.body());
+            }
+
+            Map<String, Object> result = objectMapper.readValue(response.body(), Map.class);
+            String watchId = (String) result.get("watchId");
+            long currentRevision = ((Number) result.get("currentRevision")).longValue();
+
+            log.info("Watch created: id={}, currentRevision={}", watchId, currentRevision);
+
+            // 2. 启动 SSE 监听线程
+            WatchListener listener = new WatchListener(watchId, key, isPrefix, callback);
+            activeWatches.add(listener);
+            
+            // 异步启动事件流监听，并处理异常
+            CompletableFuture.runAsync(() -> startWatchStream(listener))
+                    .exceptionally(ex -> {
+                        log.error("Watch stream task failed: {}", watchId, ex);
+                        listener.onError(ex instanceof Exception ? (Exception) ex : new RuntimeException(ex));
+                        activeWatches.remove(listener);
+                        return null;
+                    });
+
+            return listener;
+
+        } catch (Exception e) {
+            log.error("Failed to create watch", e);
+            throw new RuntimeException("Failed to create watch", e);
+        }
+    }
+
+    /**
+     * 启动 Watch 事件流监听
+     */
+    private void startWatchStream(WatchListener listener) {
+        try {
+            String url = getCurrentLeader() + "/watch/" + listener.getWatchId();
+            HttpRequest.Builder requestBuilder = HttpRequest.newBuilder()
+                    .uri(URI.create(url))
+                    .header("Accept", "text/event-stream")
+                    .GET();
+            // 长连接：不设置超时，让连接一直保持
+            HttpRequest request = requestBuilder.build();
+
+            HttpResponse<java.io.InputStream> response = httpClient.send(request, 
+                    HttpResponse.BodyHandlers.ofInputStream());
+
+            if (response.statusCode() != 200) {
+                log.error("Watch stream failed: HTTP {}", response.statusCode());
+                listener.onError(new RuntimeException("HTTP " + response.statusCode()));
+                return;
+            }
+
+            // 读取 SSE 流
+            try (BufferedReader reader = new BufferedReader(
+                    new InputStreamReader(response.body()))) {
+                String line;
+                StringBuilder eventData = new StringBuilder();
+                String eventType = "";
+
+                while (!listener.isCancelled() && (line = reader.readLine()) != null) {
+                    if (line.startsWith("event:")) {
+                        eventType = line.substring(6).trim();
+                    } else if (line.startsWith("data:")) {
+                        // 多行 data 用换行符连接
+                        if (eventData.length() > 0) {
+                            eventData.append("\n");
+                        }
+                        eventData.append(line.substring(5).trim());
+                    } else if (line.isEmpty()) {
+                        // 事件结束（空行），处理事件
+                        if (eventData.length() > 0) {
+                            processWatchEvent(listener, eventType, eventData.toString());
+                            eventData.setLength(0);
+                            eventType = "";
+                        }
+                    }
+                }
+            }
+
+            log.info("Watch stream ended: {}", listener.getWatchId());
+            listener.onComplete();
+
+        } catch (Exception e) {
+            log.error("Watch stream error: {}", listener.getWatchId(), e);
+            listener.onError(e);
+        } finally {
+            activeWatches.remove(listener);
+        }
+    }
+
+    /**
+     * 处理 Watch 事件
+     */
+    private void processWatchEvent(WatchListener listener, String eventType, String data) {
+        try {
+            if ("init".equals(eventType)) {
+                // 初始化事件
+                log.debug("Watch init event: {}", data);
+                return;
+            }
+
+            // 解析事件数据
+            WatchEvent event = objectMapper.readValue(data, WatchEvent.class);
+            log.debug("Received watch event: type={}, key={}, revision={}",
+                    event.getType(), event.getKey(), event.getRevision());
+
+            // 调用回调
+            listener.getCallback().accept(event);
+
+        } catch (Exception e) {
+            log.error("Failed to process watch event: {}", data, e);
+        }
+    }
+
+    /**
+     * 取消 Watch 监听
+     * 
+     * @param watchId Watch ID
+     */
+    public void cancelWatch(String watchId) {
+        activeWatches.stream()
+                .filter(w -> w.getWatchId().equals(watchId))
+                .findFirst()
+                .ifPresent(WatchListener::cancel);
+
+        try {
+            String url = getCurrentLeader() + "/watch/" + watchId;
+            HttpRequest request = HttpRequest.newBuilder()
+                    .uri(URI.create(url))
+                    .timeout(Duration.ofSeconds(timeoutSeconds))
+                    .DELETE()
+                    .build();
+
+            httpClient.send(request, HttpResponse.BodyHandlers.discarding());
+            log.info("Watch cancelled: {}", watchId);
+
+        } catch (Exception e) {
+            log.warn("Failed to cancel watch on server: {}", watchId, e);
+        }
+    }
+
+    /**
+     * 获取当前全局版本号
+     * 
+     * @return 当前 revision，失败返回 -1
+     */
+    public long getCurrentRevision() {
+        try {
+            String url = getCurrentLeader() + "/watch/revision";
+            HttpRequest request = HttpRequest.newBuilder()
+                    .uri(URI.create(url))
+                    .timeout(Duration.ofSeconds(timeoutSeconds))
+                    .GET()
+                    .build();
+
+            HttpResponse<String> response = httpClient.send(request, HttpResponse.BodyHandlers.ofString());
+
+            if (response.statusCode() == 200) {
+                Map<String, Object> result = objectMapper.readValue(response.body(), Map.class);
+                return ((Number) result.get("revision")).longValue();
+            }
+        } catch (Exception e) {
+            log.error("Failed to get current revision", e);
+        }
+        return -1;
+    }
+
+    /**
+     * 关闭所有 Watch 监听
+     */
+    public void closeAllWatches() {
+        for (WatchListener listener : activeWatches) {
+            listener.cancel();
+        }
+        activeWatches.clear();
+        log.info("All watches closed");
+    }
+
+    /**
+     * Watch 监听器类
+     */
+    public static class WatchListener {
+        private final String watchId;
+        private final String key;
+        private final boolean isPrefix;
+        private final Consumer<WatchEvent> callback;
+        private volatile boolean cancelled = false;
+        private volatile boolean completed = false;
+        private Exception error = null;
+
+        public WatchListener(String watchId, String key, boolean isPrefix, Consumer<WatchEvent> callback) {
+            this.watchId = watchId;
+            this.key = key;
+            this.isPrefix = isPrefix;
+            this.callback = callback;
+        }
+
+        public String getWatchId() {
+            return watchId;
+        }
+
+        public String getKey() {
+            return key;
+        }
+
+        public boolean isPrefix() {
+            return isPrefix;
+        }
+
+        public Consumer<WatchEvent> getCallback() {
+            return callback;
+        }
+
+        public void cancel() {
+            this.cancelled = true;
+        }
+
+        public boolean isCancelled() {
+            return cancelled;
+        }
+
+        public void onComplete() {
+            this.completed = true;
+        }
+
+        public void onError(Exception e) {
+            this.error = e;
+        }
+
+        public boolean isCompleted() {
+            return completed;
+        }
+
+        public Exception getError() {
+            return error;
+        }
     }
 }

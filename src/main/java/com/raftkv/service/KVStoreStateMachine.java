@@ -9,6 +9,7 @@ import com.alipay.sofa.jraft.storage.snapshot.SnapshotReader;
 import com.alipay.sofa.jraft.storage.snapshot.SnapshotWriter;
 import com.raftkv.entity.KVResponse;
 import com.raftkv.entity.KVTask;
+import com.raftkv.entity.WatchEvent;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -97,6 +98,38 @@ public class KVStoreStateMachine extends StateMachineAdapter {
     
     // 读锁，用于保护 get 操作
     private final Object readLock = new Object();
+
+    // ==================== Watch 机制相关字段 ====================
+    
+    // 全局版本号（用于 Watch 机制）
+    // 每次写操作（PUT/DELETE）都会递增
+    // 用于事件的排序和去重
+    private final AtomicLong globalRevision = new AtomicLong(0);
+    
+    // Key 的版本信息（用于 etcd 风格的版本追踪）
+    // Key: key 名称
+    // Value: KeyVersion 对象（包含 createRevision, version 等）
+    private final Map<String, KeyVersion> keyVersions = new ConcurrentHashMap<>();
+    
+    // Watch 管理器（由外部注入）
+    private volatile WatchManager watchManager;
+    
+    /**
+     * Key 的版本信息
+     */
+    private static class KeyVersion {
+        long createRevision;  // 创建时的全局版本号
+        long version;         // 本地版本号（每次修改 +1）
+        
+        KeyVersion(long createRevision) {
+            this.createRevision = createRevision;
+            this.version = 1;
+        }
+        
+        long incrementVersion() {
+            return ++version;
+        }
+    }
 
     public KVStoreStateMachine(String dataDir) {
         // 数据目录由 Raft 管理，状态机不再需要自己管理文件
@@ -328,17 +361,101 @@ public class KVStoreStateMachine extends StateMachineAdapter {
         synchronized (kvStore) {
             switch (task.getOp()) {
                 case KVTask.OP_PUT:
-                    kvStore.put(task.getKey(), task.getValue());
-                    LOG.info("PUT: key={}, value={}", task.getKey(), task.getValue());
+                    applyPut(task.getKey(), task.getValue());
                     break;
                 case KVTask.OP_DELETE:
-                    kvStore.remove(task.getKey());
-                    LOG.info("DELETE: key={}", task.getKey());
+                    applyDelete(task.getKey());
                     break;
                 default:
                     LOG.warn("Unknown operation: {}", task.getOp());
             }
         }
+    }
+
+    /**
+     * 应用 PUT 操作并生成 Watch 事件
+     */
+    private void applyPut(String key, String value) {
+        // 生成新的全局版本号
+        long revision = globalRevision.incrementAndGet();
+        
+        // 获取或创建 Key 的版本信息
+        KeyVersion keyVersion = keyVersions.get(key);
+        long createRevision;
+        long version;
+        
+        if (keyVersion == null) {
+            // 新 Key
+            createRevision = revision;
+            keyVersion = new KeyVersion(createRevision);
+            keyVersions.put(key, keyVersion);
+            version = 1;
+            LOG.info("PUT (new): key={}, value={}, revision={}, createRevision={}", 
+                    key, value, revision, createRevision);
+        } else {
+            // 已存在的 Key
+            createRevision = keyVersion.createRevision;
+            version = keyVersion.incrementVersion();
+            LOG.info("PUT (update): key={}, value={}, revision={}, version={}", 
+                    key, value, revision, version);
+        }
+        
+        // 更新数据存储
+        kvStore.put(key, value);
+        
+        // 生成 Watch 事件
+        publishWatchEvent(WatchEvent.put(key, value, revision, createRevision, version));
+    }
+
+    /**
+     * 应用 DELETE 操作并生成 Watch 事件
+     */
+    private void applyDelete(String key) {
+        // 生成新的全局版本号
+        long revision = globalRevision.incrementAndGet();
+        
+        // 删除数据和版本信息
+        kvStore.remove(key);
+        keyVersions.remove(key);
+        
+        LOG.info("DELETE: key={}, revision={}", key, revision);
+        
+        // 生成 Watch 事件
+        publishWatchEvent(WatchEvent.delete(key, revision));
+    }
+
+    /**
+     * 发布 Watch 事件
+     * 
+     * @param event Watch 事件
+     */
+    private void publishWatchEvent(WatchEvent event) {
+        if (watchManager != null) {
+            try {
+                watchManager.publishEvent(event);
+            } catch (Exception e) {
+                LOG.error("Failed to publish watch event: {}", event, e);
+            }
+        }
+    }
+
+    /**
+     * 设置 WatchManager（由 RaftKVService 注入）
+     * 
+     * @param watchManager Watch 管理器
+     */
+    public void setWatchManager(WatchManager watchManager) {
+        this.watchManager = watchManager;
+        LOG.info("WatchManager injected into state machine");
+    }
+
+    /**
+     * 获取当前全局版本号
+     * 
+     * @return 当前 revision
+     */
+    public long getCurrentRevision() {
+        return globalRevision.get();
     }
 
     private KVTask deserialize(byte[] data) {
@@ -469,7 +586,7 @@ public class KVStoreStateMachine extends StateMachineAdapter {
     public void onSnapshotSave(SnapshotWriter writer, Closure done) {
         LOG.info("onSnapshotSave starting...");
         try {
-            // 将 kvStore 和 processedRequests 打包成一个整体保存
+            // 将 kvStore、processedRequests、revision 和 keyVersions 打包成一个整体保存
             Map<String, Object> snapshotData = new HashMap<>();
             
             // 加锁保证快照期间数据不被修改
@@ -480,6 +597,19 @@ public class KVStoreStateMachine extends StateMachineAdapter {
                 // 将 LRU Cache 转换为普通 Map 保存
                 snapshotData.put("processedRequests", new HashMap<>(processedRequests));
             }
+            
+            // 保存 Watch 机制相关的状态
+            snapshotData.put("globalRevision", globalRevision.get());
+            
+            // 保存 keyVersions（转换为可序列化的格式）
+            Map<String, Map<String, Long>> keyVersionMap = new HashMap<>();
+            for (Map.Entry<String, KeyVersion> entry : keyVersions.entrySet()) {
+                Map<String, Long> versionData = new HashMap<>();
+                versionData.put("createRevision", entry.getValue().createRevision);
+                versionData.put("version", entry.getValue().version);
+                keyVersionMap.put(entry.getKey(), versionData);
+            }
+            snapshotData.put("keyVersions", keyVersionMap);
 
             // 写入快照文件
             Path snapshotFile = Paths.get(writer.getPath() + File.separator + "machine-data.json");
@@ -488,8 +618,8 @@ public class KVStoreStateMachine extends StateMachineAdapter {
             // 告诉 Raft 引擎这个文件是快照的一部分
             if (writer.addFile("machine-data.json")) {
                 done.run(Status.OK());
-                LOG.info("Snapshot saved successfully: {} keys, {} cached requests", 
-                        kvStore.size(), processedRequests.size());
+                LOG.info("Snapshot saved successfully: {} keys, {} cached requests, revision={}", 
+                        kvStore.size(), processedRequests.size(), globalRevision.get());
             } else {
                 done.run(new Status(-1, "Failed to add file to snapshot writer"));
             }
@@ -556,9 +686,30 @@ public class KVStoreStateMachine extends StateMachineAdapter {
                         }
                     }
                 }
+                
+                // 3. 恢复 Watch 机制相关的状态
+                Long loadedRevision = (Long) snapshotData.get("globalRevision");
+                if (loadedRevision != null) {
+                    globalRevision.set(loadedRevision);
+                    LOG.info("Restored global revision: {}", loadedRevision);
+                }
+                
+                // 4. 恢复 keyVersions
+                Map<String, Map<String, Long>> loadedKeyVersions = 
+                        (Map<String, Map<String, Long>>) snapshotData.get("keyVersions");
+                if (loadedKeyVersions != null) {
+                    keyVersions.clear();
+                    for (Map.Entry<String, Map<String, Long>> entry : loadedKeyVersions.entrySet()) {
+                        Map<String, Long> versionData = entry.getValue();
+                        KeyVersion kv = new KeyVersion(versionData.getOrDefault("createRevision", 0L));
+                        kv.version = versionData.getOrDefault("version", 1L);
+                        keyVersions.put(entry.getKey(), kv);
+                    }
+                    LOG.info("Restored {} key versions", keyVersions.size());
+                }
 
-                LOG.info("Snapshot loaded successfully: {} keys, {} cached requests",
-                        kvStore.size(), processedRequests.size());
+                LOG.info("Snapshot loaded successfully: {} keys, {} cached requests, revision={}",
+                        kvStore.size(), processedRequests.size(), globalRevision.get());
                 return true;
             }
             return false;
