@@ -53,16 +53,27 @@ public class KVController {
     }
 
     /**
-     * PUT a key-value pair（支持幂等）
+     * PUT a key-value pair（支持幂等，支持带斜杠的key）
      *
-     * @param key   The key
-     * @param body  The request body (must contain "value", optional "requestId")
+     * @param key   The key (路径变量，支持简单key)
+     * @param body  The request body (must contain "value", optional "requestId", optional "key")
      * @return Response indicating success or failure
      */
-    @PutMapping("/{key}")
+    @PutMapping({"", "/", "/{key:.+}"})
     public ResponseEntity<KVResponse> put(
-            @PathVariable String key,
+            @PathVariable(required = false) String key,
             @RequestBody Map<String, Object> body) {
+
+        // 优先从 body 获取 key（支持带斜杠的key）
+        String actualKey = (String) body.get("key");
+        if (actualKey == null || actualKey.isEmpty()) {
+            actualKey = key;
+        }
+
+        if (actualKey == null || actualKey.isEmpty()) {
+            return ResponseEntity.badRequest()
+                    .body(KVResponse.failure("Missing 'key' in request", null));
+        }
 
         String value = (String) body.get("value");
         if (value == null) {
@@ -71,16 +82,15 @@ public class KVController {
         }
 
         // 客户端可以提供 requestId（用于幂等）
-        // 如果不提供，服务端会自动生成
         String requestId = (String) body.get("requestId");
 
-        log.info("PUT request: key={}, value={}, requestId={}", key, value, requestId);
-        KVResponse response = raftKVService.put(key, value, requestId);
+        log.info("PUT request: key={}, value={}, requestId={}", actualKey, value, requestId);
+        KVResponse response = raftKVService.put(actualKey, value, requestId);
 
         if (!response.isSuccess() && "NOT_LEADER".equals(response.getError())) {
             // Redirect to leader
             return ResponseEntity.status(301)
-                    .header("Location", "http://" + response.getLeaderEndpoint() + "/kv/" + key)
+                    .header("Location", "http://" + response.getLeaderEndpoint() + "/kv/" + actualKey)
                     .body(response);
         }
 
@@ -88,20 +98,32 @@ public class KVController {
     }
 
     /**
-     * GET a value by key
+     * GET a value by key（支持带斜杠的key）
      *
-     * @param key The key
+     * @param key The key (路径变量，支持简单key)
+     * @param keyParam The key (查询参数，支持带斜杠的key)
      * @return The value if found
      */
-    @GetMapping("/{key}")
-    public ResponseEntity<KVResponse> get(@PathVariable String key) {
-        log.debug("GET request: key={}", key);
-        KVResponse response = raftKVService.get(key);
+    @GetMapping({"", "/", "/{key:.+}"})
+    public ResponseEntity<KVResponse> get(
+            @PathVariable(required = false) String key,
+            @RequestParam(required = false) String keyParam) {
+
+        // 优先使用查询参数（支持带斜杠的key）
+        String actualKey = (keyParam != null && !keyParam.isEmpty()) ? keyParam : key;
+
+        if (actualKey == null || actualKey.isEmpty()) {
+            return ResponseEntity.badRequest()
+                    .body(KVResponse.failure("Missing 'key' parameter", null));
+        }
+
+        log.debug("GET request: key={}", actualKey);
+        KVResponse response = raftKVService.get(actualKey);
 
         if (!response.isSuccess() && "NOT_LEADER".equals(response.getError())) {
             // Redirect to leader
             return ResponseEntity.status(301)
-                    .header("Location", "http://" + response.getLeaderEndpoint() + "/kv/" + key)
+                    .header("Location", "http://" + response.getLeaderEndpoint() + "/kv/" + actualKey)
                     .body(response);
         }
 
@@ -109,24 +131,34 @@ public class KVController {
     }
 
     /**
-     * DELETE a key（支持幂等）
+     * DELETE a key（支持幂等，支持带斜杠的key）
      *
-     * @param key       The key to delete
+     * @param key       The key to delete (路径变量)
+     * @param keyParam  The key to delete (查询参数，支持带斜杠的key)
      * @param requestId Optional request ID for idempotency
      * @return Response indicating success or failure
      */
-    @DeleteMapping("/{key}")
+    @DeleteMapping({"", "/", "/{key:.+}"})
     public ResponseEntity<KVResponse> delete(
-            @PathVariable String key,
+            @PathVariable(required = false) String key,
+            @RequestParam(required = false) String keyParam,
             @RequestParam(required = false) String requestId) {
-        
-        log.info("DELETE request: key={}, requestId={}", key, requestId);
-        KVResponse response = raftKVService.delete(key, requestId);
+
+        // 优先使用查询参数（支持带斜杠的key）
+        String actualKey = (keyParam != null && !keyParam.isEmpty()) ? keyParam : key;
+
+        if (actualKey == null || actualKey.isEmpty()) {
+            return ResponseEntity.badRequest()
+                    .body(KVResponse.failure("Missing 'key' parameter", null));
+        }
+
+        log.info("DELETE request: key={}, requestId={}", actualKey, requestId);
+        KVResponse response = raftKVService.delete(actualKey, requestId);
 
         if (!response.isSuccess() && "NOT_LEADER".equals(response.getError())) {
             // Redirect to leader
             return ResponseEntity.status(301)
-                    .header("Location", "http://" + response.getLeaderEndpoint() + "/kv/" + key)
+                    .header("Location", "http://" + response.getLeaderEndpoint() + "/kv/" + actualKey)
                     .body(response);
         }
 

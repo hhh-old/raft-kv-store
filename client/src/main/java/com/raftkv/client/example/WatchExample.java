@@ -1,7 +1,7 @@
 package com.raftkv.client.example;
 
 import com.raftkv.client.RaftKVClient;
-import com.raftkv.client.entity.WatchEvent;
+import com.raftkv.entity.WatchEvent;
 import lombok.extern.slf4j.Slf4j;
 
 import java.util.Arrays;

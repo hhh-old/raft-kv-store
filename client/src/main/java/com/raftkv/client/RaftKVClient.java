@@ -1,8 +1,7 @@
 package com.raftkv.client;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
-import com.raftkv.client.entity.KVResponse;
-import com.raftkv.client.entity.WatchEvent;
+import com.raftkv.entity.*;
 import lombok.extern.slf4j.Slf4j;
 
 import java.io.BufferedReader;
@@ -84,6 +83,22 @@ public class RaftKVClient {
     }
 
     /**
+     * 便捷构造函数（使用默认配置）
+     *
+     * @param serverUrl 服务器地址，如 "http://localhost:9081"
+     */
+    public RaftKVClient(String serverUrl) {
+        this.serverUrls = java.util.List.of(serverUrl);
+        this.maxRetries = 3;
+        this.timeoutSeconds = 8;
+        this.objectMapper = new ObjectMapper();
+        this.httpClient = HttpClient.newBuilder()
+                .connectTimeout(Duration.ofSeconds(timeoutSeconds))
+                .build();
+        this.currentLeader.set(serverUrl);
+    }
+
+    /**
      * 创建 Builder
      */
     public static Builder builder() {
@@ -114,18 +129,19 @@ public class RaftKVClient {
         log.debug("PUT request: key={}, value={}, requestId={}", key, value, requestId);
 
         Map<String, Object> body = new HashMap<>();
+        body.put("key", key);  // 将 key 放入 body，支持带斜杠的 key
         body.put("value", value);
         body.put("requestId", requestId);
 
         return executeWithRetry("PUT", () -> {
-            String url = getCurrentLeader() + "/kv/" + key;
+            String url = getCurrentLeader() + "/kv";
             return executeRequest(url, "PUT", body);
         });
     }
 
     /**
      * GET 操作
-     * 
+     *
      * @param key 键
      * @return 响应
      */
@@ -133,14 +149,16 @@ public class RaftKVClient {
         log.debug("GET request: key={}", key);
 
         return executeWithRetry("GET", () -> {
-            String url = getCurrentLeader() + "/kv/" + key;
+            // 使用查询参数传递 key，支持带斜杠的 key
+            String encodedKey = java.net.URLEncoder.encode(key, java.nio.charset.StandardCharsets.UTF_8);
+            String url = getCurrentLeader() + "/kv?keyParam=" + encodedKey;
             return executeRequest(url, "GET", null);
         });
     }
 
     /**
      * DELETE 操作（自动生成 requestId）
-     * 
+     *
      * @param key 键
      * @return 响应
      */
@@ -151,7 +169,7 @@ public class RaftKVClient {
 
     /**
      * DELETE 操作（指定 requestId，支持幂等）
-     * 
+     *
      * @param key 键
      * @param requestId 请求 ID（重试时必须相同）
      * @return 响应
@@ -160,7 +178,9 @@ public class RaftKVClient {
         log.debug("DELETE request: key={}, requestId={}", key, requestId);
 
         return executeWithRetry("DELETE", () -> {
-            String url = getCurrentLeader() + "/kv/" + key + "?requestId=" + requestId;
+            // 使用查询参数传递 key，支持带斜杠的 key
+            String encodedKey = java.net.URLEncoder.encode(key, java.nio.charset.StandardCharsets.UTF_8);
+            String url = getCurrentLeader() + "/kv?keyParam=" + encodedKey + "&requestId=" + requestId;
             return executeRequest(url, "DELETE", null);
         });
     }
@@ -309,7 +329,7 @@ public class RaftKVClient {
                 // 处理重定向循环：直到不是重定向为止
                 while (response.isNotLeader() && response.getLeaderUrl() != null) {
                     log.info("Redirecting to Leader: {}", response.getLeaderUrl());
-                    currentLeader.set(response.getLeaderUrl());
+                    updateLeader(response.getLeaderUrl());  // 使用 normalizeUrl 处理
                     log.debug("Updated leader, retrying with: {}", currentLeader.get());
                     response = executor.execute();
                     log.debug("After redirect - Response: success={}, error={}, isNotLeader={}",
@@ -415,10 +435,26 @@ public class RaftKVClient {
 
     /**
      * 更新 Leader 地址
+     * 自动处理 URL 格式（添加 http:// 前缀如果缺失）
      */
     public void updateLeader(String leaderUrl) {
-        currentLeader.set(leaderUrl);
-        log.info("Updated leader to: {}", leaderUrl);
+        String normalizedUrl = normalizeUrl(leaderUrl);
+        currentLeader.set(normalizedUrl);
+        log.info("Updated leader to: {}", normalizedUrl);
+    }
+
+    /**
+     * 规范化 URL，确保包含协议前缀
+     */
+    private String normalizeUrl(String url) {
+        if (url == null || url.isEmpty()) {
+            return url;
+        }
+        // 如果 URL 不以 http:// 或 https:// 开头，添加 http://
+        if (!url.startsWith("http://") && !url.startsWith("https://")) {
+            return "http://" + url;
+        }
+        return url;
     }
 
     /**
@@ -704,6 +740,235 @@ public class RaftKVClient {
         }
         activeWatches.clear();
         log.info("All watches closed");
+    }
+
+    // ==================== 事务支持 ====================
+
+    /**
+     * 执行事务
+     *
+     * @param txnRequest 事务请求
+     * @return 事务响应
+     */
+    public TxnResponse transaction(TxnRequest txnRequest) {
+        Exception lastException = null;
+
+        for (int attempt = 1; attempt <= maxRetries; attempt++) {
+            try {
+                log.debug("Attempt {} to execute transaction using leader: {}", attempt, currentLeader.get());
+
+                String url = getCurrentLeader() + "/txn";
+                HttpRequest request = HttpRequest.newBuilder()
+                        .uri(URI.create(url))
+                        .timeout(Duration.ofSeconds(timeoutSeconds))
+                        .header("Content-Type", "application/json")
+                        .POST(HttpRequest.BodyPublishers.ofString(objectMapper.writeValueAsString(txnRequest)))
+                        .build();
+
+                HttpResponse<String> response = httpClient.send(request, HttpResponse.BodyHandlers.ofString());
+
+                // 处理重定向
+                if (response.statusCode() == 301) {
+                    String newLeader = response.headers().firstValue("Location")
+                            .map(loc -> loc.replace("http://", "").replace("/txn", ""))
+                            .orElse(null);
+                    if (newLeader != null) {
+                        log.info("Redirecting to Leader: {}", newLeader);
+                        updateLeader(newLeader);
+                    }
+                    continue;  // 重试
+                }
+
+                if (response.statusCode() != 200) {
+                    throw new RuntimeException("Transaction failed: HTTP " + response.statusCode());
+                }
+
+                return objectMapper.readValue(response.body(), TxnResponse.class);
+
+            } catch (Exception e) {
+                lastException = e;
+                log.warn("Transaction attempt {} failed: {}", attempt, e.getMessage());
+
+                if (attempt < maxRetries) {
+                    long waitTime = (long) Math.pow(2, attempt - 1) * 100;
+                    try {
+                        Thread.sleep(waitTime);
+                    } catch (InterruptedException ie) {
+                        Thread.currentThread().interrupt();
+                        throw new RuntimeException("Retry interrupted", ie);
+                    }
+                }
+            }
+        }
+
+        throw new RuntimeException("Transaction failed after " + maxRetries + " attempts", lastException);
+    }
+
+    /**
+     * CAS（Compare-And-Swap）操作
+     *
+     * @param key key
+     * @param expectedValue 预期值
+     * @param newValue 新值
+     * @return 事务响应
+     */
+    public TxnResponse cas(String key, String expectedValue, String newValue) {
+        Map<String, Object> request = new HashMap<>();
+        request.put("key", key);
+        request.put("expectedValue", expectedValue);
+        request.put("newValue", newValue);
+
+        Exception lastException = null;
+
+        for (int attempt = 1; attempt <= maxRetries; attempt++) {
+            try {
+                String url = getCurrentLeader() + "/txn/cas";
+                HttpRequest httpRequest = HttpRequest.newBuilder()
+                        .uri(URI.create(url))
+                        .timeout(Duration.ofSeconds(timeoutSeconds))
+                        .header("Content-Type", "application/json")
+                        .POST(HttpRequest.BodyPublishers.ofString(objectMapper.writeValueAsString(request)))
+                        .build();
+
+                HttpResponse<String> response = httpClient.send(httpRequest, HttpResponse.BodyHandlers.ofString());
+
+                if (response.statusCode() == 301) {
+                    String newLeader = response.headers().firstValue("Location")
+                            .map(loc -> loc.replace("http://", "").replace("/txn/cas", ""))
+                            .orElse(null);
+                    if (newLeader != null) {
+                        updateLeader(newLeader);
+                    }
+                    continue;
+                }
+
+                if (response.statusCode() != 200) {
+                    throw new RuntimeException("CAS failed: HTTP " + response.statusCode());
+                }
+
+                return objectMapper.readValue(response.body(), TxnResponse.class);
+
+            } catch (Exception e) {
+                lastException = e;
+                log.warn("CAS attempt {} failed: {}", attempt, e.getMessage());
+
+                if (attempt < maxRetries) {
+                    long waitTime = (long) Math.pow(2, attempt - 1) * 100;
+                    try {
+                        Thread.sleep(waitTime);
+                    } catch (InterruptedException ie) {
+                        Thread.currentThread().interrupt();
+                        throw new RuntimeException("Retry interrupted", ie);
+                    }
+                }
+            }
+        }
+
+        throw new RuntimeException("CAS failed after " + maxRetries + " attempts", lastException);
+    }
+
+    /**
+     * CAS 使用版本号
+     *
+     * @param key key
+     * @param expectedVersion 预期版本号
+     * @param newValue 新值
+     * @return 事务响应
+     */
+    public TxnResponse casWithVersion(String key, long expectedVersion, String newValue) {
+        TxnRequest txnRequest = TxnRequest.builder()
+                .compares(java.util.List.of(Compare.version(key, Compare.CompareOp.EQUAL, expectedVersion)))
+                .success(java.util.List.of(Operation.put(key, newValue)))
+                .failure(java.util.List.of(Operation.get(key)))
+                .build();
+
+        return transaction(txnRequest);
+    }
+
+    /**
+     * 获取分布式锁
+     *
+     * @param lockKey 锁的 key
+     * @param owner 锁的持有者标识
+     * @return true 如果获取锁成功
+     */
+    public boolean acquireLock(String lockKey, String owner) {
+        Map<String, Object> request = new HashMap<>();
+        request.put("lockKey", lockKey);
+        request.put("owner", owner);
+
+        try {
+            String url = getCurrentLeader() + "/txn/lock";
+            HttpRequest httpRequest = HttpRequest.newBuilder()
+                    .uri(URI.create(url))
+                    .timeout(Duration.ofSeconds(timeoutSeconds))
+                    .header("Content-Type", "application/json")
+                    .POST(HttpRequest.BodyPublishers.ofString(objectMapper.writeValueAsString(request)))
+                    .build();
+
+            HttpResponse<String> response = httpClient.send(httpRequest, HttpResponse.BodyHandlers.ofString());
+
+            if (response.statusCode() == 301) {
+                String newLeader = response.headers().firstValue("Location")
+                        .map(loc -> loc.replace("http://", "").replace("/txn/lock", ""))
+                        .orElse(null);
+                if (newLeader != null) {
+                    updateLeader(newLeader);
+                    return acquireLock(lockKey, owner);  // 重试
+                }
+                return false;
+            }
+
+            TxnResponse txnResponse = objectMapper.readValue(response.body(), TxnResponse.class);
+            return txnResponse.isSucceeded();
+
+        } catch (Exception e) {
+            log.error("Failed to acquire lock: {} for owner: {}", lockKey, owner, e);
+            return false;
+        }
+    }
+
+    /**
+     * 释放分布式锁
+     *
+     * @param lockKey 锁的 key
+     * @param owner 锁的持有者标识
+     * @return true 如果释放锁成功
+     */
+    public boolean releaseLock(String lockKey, String owner) {
+        Map<String, Object> request = new HashMap<>();
+        request.put("lockKey", lockKey);
+        request.put("owner", owner);
+
+        try {
+            String url = getCurrentLeader() + "/txn/unlock";
+            HttpRequest httpRequest = HttpRequest.newBuilder()
+                    .uri(URI.create(url))
+                    .timeout(Duration.ofSeconds(timeoutSeconds))
+                    .header("Content-Type", "application/json")
+                    .POST(HttpRequest.BodyPublishers.ofString(objectMapper.writeValueAsString(request)))
+                    .build();
+
+            HttpResponse<String> response = httpClient.send(httpRequest, HttpResponse.BodyHandlers.ofString());
+
+            if (response.statusCode() == 301) {
+                String newLeader = response.headers().firstValue("Location")
+                        .map(loc -> loc.replace("http://", "").replace("/txn/unlock", ""))
+                        .orElse(null);
+                if (newLeader != null) {
+                    updateLeader(newLeader);
+                    return releaseLock(lockKey, owner);  // 重试
+                }
+                return false;
+            }
+
+            TxnResponse txnResponse = objectMapper.readValue(response.body(), TxnResponse.class);
+            return txnResponse.isSucceeded();
+
+        } catch (Exception e) {
+            log.error("Failed to release lock: {} for owner: {}", lockKey, owner, e);
+            return false;
+        }
     }
 
     /**

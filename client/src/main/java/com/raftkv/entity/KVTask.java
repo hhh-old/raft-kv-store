@@ -52,12 +52,6 @@ public class KVTask implements Serializable {
      */
     private transient TxnRequest txnRequest;
 
-    /**
-     * 事务响应结果（仅在 onApply 后设置，用于回调获取结果）
-     * 使用 transient 避免序列化
-     */
-    private transient TxnResponse txnResponse;
-
     public static KVTask put(String key, String value, String requestId) {
         KVTask task = new KVTask();
         task.setOp(OP_PUT);

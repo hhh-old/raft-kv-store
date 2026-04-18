@@ -7,9 +7,7 @@ import com.alipay.sofa.jraft.core.StateMachineAdapter;
 import com.alipay.sofa.jraft.error.RaftException;
 import com.alipay.sofa.jraft.storage.snapshot.SnapshotReader;
 import com.alipay.sofa.jraft.storage.snapshot.SnapshotWriter;
-import com.raftkv.entity.KVResponse;
-import com.raftkv.entity.KVTask;
-import com.raftkv.entity.WatchEvent;
+import com.raftkv.entity.*;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -78,6 +76,18 @@ public class KVStoreStateMachine extends StateMachineAdapter {
      * 使用 LRU 策略：超过限制时自动淘汰最久未使用的请求
      */
     private static final int MAX_CACHE_SIZE = 10000;
+
+    /**
+     * 事务结果缓存（用于回调获取结果）
+     * key: requestId, value: TxnResponse
+     * 使用 ConcurrentHashMap 保证线程安全
+     */
+    private final Map<String, TxnResponse> txnResultCache = new ConcurrentHashMap<>();
+    
+    /**
+     * 事务结果缓存大小限制
+     */
+    private static final int MAX_TXN_CACHE_SIZE = 10000;
     
     // 当前任期号（term）
     // term 是 Raft 协议中的逻辑时钟，用于检测过时的信息
@@ -115,17 +125,29 @@ public class KVStoreStateMachine extends StateMachineAdapter {
     private volatile WatchManager watchManager;
     
     /**
-     * Key 的版本信息
+     * Key 的版本信息 - 对齐 etcd 语义
      */
     private static class KeyVersion {
         long createRevision;  // 创建时的全局版本号
+        long modRevision;     // 最后修改时的全局版本号（etcd 语义）
         long version;         // 本地版本号（每次修改 +1）
-        
+
         KeyVersion(long createRevision) {
             this.createRevision = createRevision;
+            this.modRevision = createRevision;  // 创建时，modRevision = createRevision
             this.version = 1;
         }
-        
+
+        /**
+         * 更新修改版本号
+         * @param newModRevision 新的全局版本号
+         * @return 递增后的本地版本号
+         */
+        long updateModification(long newModRevision) {
+            this.modRevision = newModRevision;
+            return ++version;
+        }
+
         long incrementVersion() {
             return ++version;
         }
@@ -141,6 +163,23 @@ public class KVStoreStateMachine extends StateMachineAdapter {
         synchronized (readLock) {
             return kvStore.get(key);
         }
+    }
+
+    /**
+     * 获取事务执行结果（用于回调）
+     * @param requestId 请求 ID
+     * @return 事务响应，如果不存在返回 null
+     */
+    public TxnResponse getTxnResult(String requestId) {
+        return txnResultCache.get(requestId);
+    }
+
+    /**
+     * 移除事务结果（清理缓存）
+     * @param requestId 请求 ID
+     */
+    public void removeTxnResult(String requestId) {
+        txnResultCache.remove(requestId);
     }
 
     public Map<String, String> getAll() {
@@ -365,6 +404,29 @@ public class KVStoreStateMachine extends StateMachineAdapter {
                     break;
                 case KVTask.OP_DELETE:
                     applyDelete(task.getKey());
+                    break;
+                case KVTask.OP_TXN:
+                    // 事务操作
+                    if (task.getTxnRequest() != null) {
+                        TxnResponse txnResponse = executeTransaction(task.getTxnRequest());
+                        // 将结果缓存，供回调获取（使用 requestId 作为 key）
+                        if (task.getRequestId() != null) {
+                            // 如果缓存已满，先清理一半（LRU策略的简化版）
+                            if (txnResultCache.size() >= MAX_TXN_CACHE_SIZE) {
+                                int toRemove = MAX_TXN_CACHE_SIZE / 2;
+                                int removed = 0;
+                                for (String key : txnResultCache.keySet()) {
+                                    if (removed >= toRemove) break;
+                                    txnResultCache.remove(key);
+                                    removed++;
+                                }
+                                LOG.warn("Txn result cache reached limit, removed {} entries", removed);
+                            }
+                            txnResultCache.put(task.getRequestId(), txnResponse);
+                        }
+                    } else {
+                        LOG.warn("TXN operation without txnRequest");
+                    }
                     break;
                 default:
                     LOG.warn("Unknown operation: {}", task.getOp());
@@ -601,11 +663,12 @@ public class KVStoreStateMachine extends StateMachineAdapter {
             // 保存 Watch 机制相关的状态
             snapshotData.put("globalRevision", globalRevision.get());
             
-            // 保存 keyVersions（转换为可序列化的格式）
+            // 保存 keyVersions（转换为可序列化的格式）- 包含 modRevision
             Map<String, Map<String, Long>> keyVersionMap = new HashMap<>();
             for (Map.Entry<String, KeyVersion> entry : keyVersions.entrySet()) {
                 Map<String, Long> versionData = new HashMap<>();
                 versionData.put("createRevision", entry.getValue().createRevision);
+                versionData.put("modRevision", entry.getValue().modRevision);
                 versionData.put("version", entry.getValue().version);
                 keyVersionMap.put(entry.getKey(), versionData);
             }
@@ -694,14 +757,17 @@ public class KVStoreStateMachine extends StateMachineAdapter {
                     LOG.info("Restored global revision: {}", loadedRevision);
                 }
                 
-                // 4. 恢复 keyVersions
-                Map<String, Map<String, Long>> loadedKeyVersions = 
+                // 4. 恢复 keyVersions（包含 modRevision）
+                Map<String, Map<String, Long>> loadedKeyVersions =
                         (Map<String, Map<String, Long>>) snapshotData.get("keyVersions");
                 if (loadedKeyVersions != null) {
                     keyVersions.clear();
                     for (Map.Entry<String, Map<String, Long>> entry : loadedKeyVersions.entrySet()) {
                         Map<String, Long> versionData = entry.getValue();
-                        KeyVersion kv = new KeyVersion(versionData.getOrDefault("createRevision", 0L));
+                        long createRevision = versionData.getOrDefault("createRevision", 0L);
+                        KeyVersion kv = new KeyVersion(createRevision);
+                        // 恢复 modRevision（兼容旧快照：如果没有则使用 createRevision）
+                        kv.modRevision = versionData.getOrDefault("modRevision", createRevision);
                         kv.version = versionData.getOrDefault("version", 1L);
                         keyVersions.put(entry.getKey(), kv);
                     }
@@ -716,6 +782,363 @@ public class KVStoreStateMachine extends StateMachineAdapter {
         } catch (Exception e) {
             LOG.error("Failed to load snapshot", e);
             return false;
+        }
+    }
+
+    // ==================== 事务支持 ====================
+
+    /**
+     * 执行事务 - 对齐 etcd 语义
+     *
+     * 事务执行流程：
+     * 1. 评估所有 compare 条件（AND 关系）
+     * 2. 如果全部条件满足，执行 success 操作列表
+     * 3. 如果有任何条件不满足，执行 failure 操作列表
+     * 4. 返回事务执行结果
+     *
+     * 事务内可见性：
+     * - 事务内的 GET 操作可以看到同一事务中前面 PUT/DELETE 的修改
+     * - 这是 etcd 的标准语义
+     *
+     * @param txnRequest 事务请求
+     * @return 事务响应
+     */
+    public TxnResponse executeTransaction(TxnRequest txnRequest) {
+        synchronized (kvStore) {
+            try {
+                // 1. 评估所有 compare 条件
+                boolean allConditionsMet = evaluateCompares(txnRequest.getCompares());
+
+                // 2. 根据条件结果选择执行的操作列表
+                java.util.List<Operation> opsToExecute = allConditionsMet
+                        ? txnRequest.getSuccess()
+                        : txnRequest.getFailure();
+
+                // 3. 执行操作列表（支持事务内可见性）
+                java.util.Map<Integer, TxnResponse.OpResult> results = new java.util.HashMap<>();
+                // 事务上下文：存储事务内的临时修改，让后续操作可见
+                java.util.Map<String, String> txnContext = new java.util.HashMap<>();
+                java.util.Map<String, KeyVersion> txnVersionContext = new java.util.HashMap<>();
+
+                for (int i = 0; i < opsToExecute.size(); i++) {
+                    Operation op = opsToExecute.get(i);
+                    TxnResponse.OpResult result = executeOperationWithContext(op, txnContext, txnVersionContext);
+                    results.put(i, result);
+                }
+
+                // 4. 构建响应
+                if (allConditionsMet) {
+                    return TxnResponse.success(opsToExecute, results);
+                } else {
+                    return TxnResponse.failure(opsToExecute, results);
+                }
+
+            } catch (Exception e) {
+                LOG.error("Failed to execute transaction", e);
+                return TxnResponse.error("Transaction failed: " + e.getMessage());
+            }
+        }
+    }
+
+    /**
+     * 评估所有 compare 条件
+     *
+     * @param compares 条件列表
+     * @return true 如果所有条件都满足（AND 关系）
+     */
+    private boolean evaluateCompares(java.util.List<Compare> compares) {
+        if (compares == null || compares.isEmpty()) {
+            return true;  // 没有条件，默认为 true
+        }
+
+        for (Compare compare : compares) {
+            if (!evaluateCompare(compare)) {
+                return false;  // 有一个条件不满足，整体为 false
+            }
+        }
+        return true;  // 所有条件都满足
+    }
+
+    /**
+     * 评估单个 compare 条件
+     *
+     * @param compare 比较条件
+     * @return true 如果条件满足
+     */
+    private boolean evaluateCompare(Compare compare) {
+        String key = compare.getKey();
+        Compare.CompareType target = compare.getTarget();
+        Compare.CompareOp op = compare.getOp();
+        Object expectedValue = compare.getValue();
+
+        switch (target) {
+            case VERSION:
+                return compareVersion(key, op, ((Number) expectedValue).longValue());
+            case CREATE:
+                return compareCreateRevision(key, op, ((Number) expectedValue).longValue());
+            case MOD:
+                return compareModRevision(key, op, ((Number) expectedValue).longValue());
+            case VALUE:
+                return compareValue(key, op, (String) expectedValue);
+            default:
+                LOG.warn("Unknown compare target: {}", target);
+                return false;
+        }
+    }
+
+    /**
+     * 比较 key 的版本号
+     */
+    private boolean compareVersion(String key, Compare.CompareOp op, long expectedVersion) {
+        KeyVersion keyVersion = keyVersions.get(key);
+        long actualVersion = (keyVersion != null) ? keyVersion.version : 0;
+
+        return compareLong(actualVersion, op, expectedVersion);
+    }
+
+    /**
+     * 比较 key 的创建版本号
+     */
+    private boolean compareCreateRevision(String key, Compare.CompareOp op, long expectedCreateRev) {
+        KeyVersion keyVersion = keyVersions.get(key);
+        long actualCreateRev = (keyVersion != null) ? keyVersion.createRevision : 0;
+
+        return compareLong(actualCreateRev, op, expectedCreateRev);
+    }
+
+    /**
+     * 比较 key 的修改版本号 - 使用真正的 modRevision（对齐 etcd）
+     */
+    private boolean compareModRevision(String key, Compare.CompareOp op, long expectedModRev) {
+        KeyVersion keyVersion = keyVersions.get(key);
+        // 使用真正的 modRevision，不再是近似计算
+        long actualModRev = (keyVersion != null) ? keyVersion.modRevision : 0;
+
+        return compareLong(actualModRev, op, expectedModRev);
+    }
+
+    /**
+     * 比较 key 的值
+     */
+    private boolean compareValue(String key, Compare.CompareOp op, String expectedValue) {
+        String actualValue = kvStore.get(key);
+
+        switch (op) {
+            case EQUAL:
+                return (actualValue == null && expectedValue == null) ||
+                        (actualValue != null && actualValue.equals(expectedValue));
+            case NOT_EQUAL:
+                return (actualValue == null && expectedValue != null) ||
+                        (actualValue != null && !actualValue.equals(expectedValue));
+            case GREATER:
+                return actualValue != null && actualValue.compareTo(expectedValue) > 0;
+            case LESS:
+                return actualValue != null && actualValue.compareTo(expectedValue) < 0;
+            default:
+                return false;
+        }
+    }
+
+    /**
+     * 比较两个 long 值
+     */
+    private boolean compareLong(long actual, Compare.CompareOp op, long expected) {
+        switch (op) {
+            case EQUAL:
+                return actual == expected;
+            case NOT_EQUAL:
+                return actual != expected;
+            case GREATER:
+                return actual > expected;
+            case LESS:
+                return actual < expected;
+            default:
+                return false;
+        }
+    }
+
+    /**
+     * 执行单个操作（向后兼容 - 创建新的上下文）
+     *
+     * @param op 操作
+     * @return 操作结果
+     */
+    private TxnResponse.OpResult executeOperation(Operation op) {
+        // 创建空上下文（向后兼容）
+        java.util.Map<String, String> txnContext = new java.util.HashMap<>();
+        java.util.Map<String, KeyVersion> txnVersionContext = new java.util.HashMap<>();
+        return executeOperationWithContext(op, txnContext, txnVersionContext);
+    }
+
+    /**
+     * 在事务中执行 PUT 操作（支持事务上下文）
+     */
+    private TxnResponse.OpResult executePutInTxn(String key, String value,
+                                                  java.util.Map<String, String> txnContext,
+                                                  java.util.Map<String, KeyVersion> txnVersionContext) {
+        // 生成新的全局版本号
+        long revision = globalRevision.incrementAndGet();
+
+        // 获取或创建 Key 的版本信息（优先从事务上下文获取）
+        KeyVersion keyVersion = txnVersionContext.get(key);
+        if (keyVersion == null) {
+            keyVersion = keyVersions.get(key);
+        }
+
+        long createRevision;
+        long version;
+        KeyVersion newKeyVersion;
+
+        if (keyVersion == null) {
+            // 新 Key
+            createRevision = revision;
+            newKeyVersion = new KeyVersion(createRevision);
+            version = 1;
+        } else {
+            // 已存在的 Key - 更新 modRevision
+            createRevision = keyVersion.createRevision;
+            newKeyVersion = new KeyVersion(createRevision);
+            newKeyVersion.version = keyVersion.version;
+            version = newKeyVersion.updateModification(revision);
+        }
+
+        // 更新数据存储
+        kvStore.put(key, value);
+        keyVersions.put(key, newKeyVersion);
+
+        // 更新事务上下文（让后续操作可见）
+        txnContext.put(key, value);
+        txnVersionContext.put(key, newKeyVersion);
+
+        // 生成 Watch 事件
+        publishWatchEvent(WatchEvent.put(key, value, revision, createRevision, version));
+
+        return TxnResponse.OpResult.success(Operation.OpType.PUT, key, version, revision);
+    }
+
+    /**
+     * 在事务中执行 DELETE 操作（支持事务上下文）
+     */
+    private TxnResponse.OpResult executeDeleteInTxn(String key,
+                                                     java.util.Map<String, String> txnContext,
+                                                     java.util.Map<String, KeyVersion> txnVersionContext) {
+        // 生成新的全局版本号
+        long revision = globalRevision.incrementAndGet();
+
+        // 删除数据和版本信息
+        kvStore.remove(key);
+        keyVersions.remove(key);
+
+        // 更新事务上下文（标记为已删除）
+        txnContext.put(key, null);  // null 表示已删除
+        txnVersionContext.remove(key);
+
+        // 生成 Watch 事件
+        publishWatchEvent(WatchEvent.delete(key, revision));
+
+        return TxnResponse.OpResult.success(Operation.OpType.DELETE, key, 0, revision);
+    }
+
+    /**
+     * 在事务中执行 GET 操作（支持事务上下文）
+     */
+    private TxnResponse.OpResult executeGetInTxn(String key,
+                                                  java.util.Map<String, String> txnContext,
+                                                  java.util.Map<String, KeyVersion> txnVersionContext) {
+        // 优先从事务上下文获取（事务内可见性）
+        if (txnContext.containsKey(key)) {
+            String value = txnContext.get(key);
+            KeyVersion keyVersion = txnVersionContext.get(key);
+
+            if (value == null) {
+                // 在事务中被删除了
+                return TxnResponse.OpResult.getSuccess(key, null, 0, globalRevision.get());
+            }
+
+            long version = (keyVersion != null) ? keyVersion.version : 0;
+            long revision = (keyVersion != null) ? keyVersion.modRevision : globalRevision.get();
+            return TxnResponse.OpResult.getSuccess(key, value, version, revision);
+        }
+
+        // 从主存储获取
+        String value = kvStore.get(key);
+        KeyVersion keyVersion = keyVersions.get(key);
+
+        long version = (keyVersion != null) ? keyVersion.version : 0;
+        long revision = (keyVersion != null) ? keyVersion.modRevision : globalRevision.get();
+
+        return TxnResponse.OpResult.getSuccess(key, value, version, revision);
+    }
+
+    /**
+     * 执行单个操作（支持事务上下文）
+     *
+     * @param op 操作
+     * @param txnContext 事务上下文（存储事务内的临时修改）
+     * @param txnVersionContext 事务版本上下文
+     * @return 操作结果
+     */
+    private TxnResponse.OpResult executeOperationWithContext(Operation op,
+                                                              java.util.Map<String, String> txnContext,
+                                                              java.util.Map<String, KeyVersion> txnVersionContext) {
+        if (op == null) {
+            return TxnResponse.OpResult.failure(null, null, "Null operation");
+        }
+
+        String key = op.getKey();
+
+        switch (op.getType()) {
+            case PUT:
+                return executePutInTxn(key, op.getValue(), txnContext, txnVersionContext);
+            case DELETE:
+                return executeDeleteInTxn(key, txnContext, txnVersionContext);
+            case GET:
+                return executeGetInTxn(key, txnContext, txnVersionContext);
+            case TXN:
+                // 嵌套事务 - 传递上下文
+                TxnResponse nestedResponse = executeTransactionWithContext(op.getNestedTxn(), txnContext, txnVersionContext);
+                return TxnResponse.OpResult.builder()
+                        .success(nestedResponse.isSucceeded())
+                        .type(Operation.OpType.TXN)
+                        .build();
+            default:
+                return TxnResponse.OpResult.failure(op.getType(), key, "Unknown operation type");
+        }
+    }
+
+    /**
+     * 执行事务（支持外部上下文）- 用于嵌套事务
+     */
+    private TxnResponse executeTransactionWithContext(TxnRequest txnRequest,
+                                                       java.util.Map<String, String> txnContext,
+                                                       java.util.Map<String, KeyVersion> txnVersionContext) {
+        try {
+            // 1. 评估所有 compare 条件
+            boolean allConditionsMet = evaluateCompares(txnRequest.getCompares());
+
+            // 2. 根据条件结果选择执行的操作列表
+            java.util.List<Operation> opsToExecute = allConditionsMet
+                    ? txnRequest.getSuccess()
+                    : txnRequest.getFailure();
+
+            // 3. 执行操作列表（使用传入的上下文）
+            java.util.Map<Integer, TxnResponse.OpResult> results = new java.util.HashMap<>();
+            for (int i = 0; i < opsToExecute.size(); i++) {
+                Operation op = opsToExecute.get(i);
+                TxnResponse.OpResult result = executeOperationWithContext(op, txnContext, txnVersionContext);
+                results.put(i, result);
+            }
+
+            // 4. 构建响应
+            if (allConditionsMet) {
+                return TxnResponse.success(opsToExecute, results);
+            } else {
+                return TxnResponse.failure(opsToExecute, results);
+            }
+
+        } catch (Exception e) {
+            LOG.error("Failed to execute nested transaction", e);
+            return TxnResponse.error("Nested transaction failed: " + e.getMessage());
         }
     }
 }

@@ -1,7 +1,7 @@
 package com.raftkv.client.example;
 
 import com.raftkv.client.RaftKVClient;
-import com.raftkv.client.entity.KVResponse;
+import com.raftkv.entity.KVResponse;
 
 import java.util.Arrays;
 import java.util.Map;

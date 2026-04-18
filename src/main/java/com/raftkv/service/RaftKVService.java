@@ -12,12 +12,10 @@ import com.alipay.sofa.jraft.option.NodeOptions;
 import com.alipay.sofa.jraft.rpc.RaftRpcServerFactory;
 import com.alipay.sofa.jraft.rpc.RpcServer;
 import com.raftkv.config.RaftProperties;
-import com.raftkv.entity.ClusterStats;
-import com.raftkv.entity.KVResponse;
-import com.raftkv.entity.KVTask;
+import com.raftkv.entity.*;
 import com.fasterxml.jackson.databind.ObjectMapper;
-import jakarta.annotation.PostConstruct;
-import jakarta.annotation.PreDestroy;
+import javax.annotation.PostConstruct;
+import javax.annotation.PreDestroy;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -863,6 +861,108 @@ public class RaftKVService {
                 .leaderEndpoint(leader)
                 .key(key)
                 .build();
+    }
+
+    // ==================== 事务支持 ====================
+
+    /**
+     * 执行事务操作
+     *
+     * 事务流程：
+     * 1. 检查当前节点是否是 Leader
+     * 2. 幂等检查（如果提供了 requestId）
+     * 3. 将事务请求提交到 Raft 日志
+     * 4. 等待日志被 committed 并应用到状态机
+     * 5. 返回事务执行结果
+     *
+     * @param txnRequest 事务请求
+     * @return 事务响应
+     */
+    public TxnResponse executeTransaction(TxnRequest txnRequest) {
+        // 检查当前节点是否是 Leader
+        if (!isLeader()) {
+            return TxnResponse.notLeader(getLeaderHttpUrl());
+        }
+
+        // 如果没有提供 requestId，生成一个
+        final String requestId;
+        if (txnRequest.getRequestId() == null || txnRequest.getRequestId().isEmpty()) {
+            requestId = UUID.randomUUID().toString();
+            txnRequest.setRequestId(requestId);
+        } else {
+            requestId = txnRequest.getRequestId();
+        }
+
+        // 幂等检查：如果是重复请求，直接返回缓存的结果
+        // 注意：这里简化处理，实际应该缓存 TxnResponse
+        // 为了简化，暂时不缓存事务结果（事务通常不重复执行）
+
+        try {
+            // 创建 KVTask 对象，封装事务操作
+            KVTask task = KVTask.txn(txnRequest, requestId);
+
+            // 将 Task 序列化为字节数组
+            // 注意：需要将 TxnRequest 序列化为 JSON 存储在 value 字段
+            String txnJson = objectMapper.writeValueAsString(txnRequest);
+            task.setValue(txnJson);
+
+            byte[] data = objectMapper.writeValueAsBytes(task);
+            ByteBuffer dataBuffer = ByteBuffer.wrap(data);
+
+            // 创建 CountDownLatch 用于同步等待
+            CountDownLatch latch = new CountDownLatch(1);
+            AtomicReference<Status> statusRef = new AtomicReference<>();
+            AtomicReference<TxnResponse> txnResponseRef = new AtomicReference<>();
+
+            // 创建 Raft Task 对象
+            Task raftTask = new Task(dataBuffer, new com.alipay.sofa.jraft.Closure() {
+                @Override
+                public void run(Status status) {
+                    statusRef.set(status);
+                    // 事务已经在 onApply 中执行，结果存储在 StateMachine 的缓存中
+                    if (status.isOk()) {
+                        TxnResponse txnResponse = stateMachine.getTxnResult(requestId);
+                        if (txnResponse != null) {
+                            txnResponseRef.set(txnResponse);
+                            // 清理缓存
+                            stateMachine.removeTxnResult(requestId);
+                        }
+                    }
+                    latch.countDown();
+                }
+            });
+
+            // 将 Task 提交到 Raft 节点
+            node.apply(raftTask);
+
+            // 等待操作完成（带超时）
+            boolean success = latch.await(raftProperties.getWriteTimeout(), TimeUnit.MILLISECONDS);
+
+            if (!success) {
+                LOG.error("Transaction timeout: requestId={}", requestId);
+                return TxnResponse.error("Transaction timeout");
+            }
+
+            Status status = statusRef.get();
+            // 返回事务执行结果
+            Status raftStatus = statusRef.get();
+            if (raftStatus != null && !raftStatus.isOk()) {
+                LOG.error("Transaction failed: requestId={}, error={}", requestId, raftStatus.getErrorMsg());
+                return TxnResponse.error("Transaction failed: " + raftStatus.getErrorMsg());
+            }
+
+            // 返回事务执行结果（从 onApply 中获取）
+            TxnResponse txnResponse = txnResponseRef.get();
+            if (txnResponse != null) {
+                return txnResponse;
+            } else {
+                return TxnResponse.error("No transaction response from state machine");
+            }
+
+        } catch (Exception e) {
+            LOG.error("Failed to execute transaction: requestId={}", requestId, e);
+            return TxnResponse.error("Failed to execute transaction: " + e.getMessage());
+        }
     }
 
     @PreDestroy
