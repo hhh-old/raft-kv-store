@@ -104,16 +104,18 @@ public class WatchEvent {
 
     /**
      * 创建 DELETE 事件的便捷方法
+     *
+     * etcd 语义：DELETE 事件包含 key 当前生命周期的 createRevision 和删除后的 version。
      */
-    public static WatchEvent delete(String key, long revision) {
+    public static WatchEvent delete(String key, long revision, long createRevision, long version) {
         return WatchEvent.builder()
                 .type(EventType.DELETE)
                 .key(key)
                 .value(null)
                 .revision(revision)
-                .createRevision(0)
+                .createRevision(createRevision)
                 .modRevision(revision)
-                .version(0)
+                .version(version)
                 .build();
     }
 

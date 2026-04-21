@@ -104,6 +104,16 @@ public class TxnResponse implements Serializable {
         private long revision;
 
         /**
+         * key 的创建版本号（createRevision）
+         */
+        private long createRevision;
+
+        /**
+         * key 的修改版本号（modRevision）
+         */
+        private long modRevision;
+
+        /**
          * 错误信息
          */
         private String error;
@@ -120,6 +130,19 @@ public class TxnResponse implements Serializable {
                     .build();
         }
 
+        public static OpResult success(Operation.OpType type, String key, long version, long revision,
+                                         long createRevision, long modRevision) {
+            return OpResult.builder()
+                    .success(true)
+                    .type(type)
+                    .key(key)
+                    .version(version)
+                    .revision(revision)
+                    .createRevision(createRevision)
+                    .modRevision(modRevision)
+                    .build();
+        }
+
         public static OpResult getSuccess(String key, String value, long version, long revision) {
             return OpResult.builder()
                     .success(true)
@@ -128,6 +151,20 @@ public class TxnResponse implements Serializable {
                     .value(value)
                     .version(version)
                     .revision(revision)
+                    .build();
+        }
+
+        public static OpResult getSuccess(String key, String value, long version, long revision,
+                                           long createRevision, long modRevision) {
+            return OpResult.builder()
+                    .success(true)
+                    .type(Operation.OpType.GET)
+                    .key(key)
+                    .value(value)
+                    .version(version)
+                    .revision(revision)
+                    .createRevision(createRevision)
+                    .modRevision(modRevision)
                     .build();
         }
 

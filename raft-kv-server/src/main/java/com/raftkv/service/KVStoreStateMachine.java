@@ -469,6 +469,11 @@ public class KVStoreStateMachine extends StateMachineAdapter {
      * 应用 DELETE 操作 - 使用 MVCCStore 细粒度锁
      */
     private void applyDeleteMVCC(String key) {
+        // 先获取删除前的版本信息（delete 后 getKeyVersion 会因 tombstone 返回 null）
+        MVCCStore.KeyVersion keyVersion = mvccStore.getKeyVersion(key);
+        long createRevBefore = (keyVersion != null) ? keyVersion.createRevision : 0;
+        long versionBefore = (keyVersion != null) ? keyVersion.version : 0;
+
         // MVCCStore.delete() 返回 false 表示 key 不存在或已删除
         boolean deleted = mvccStore.delete(key);
         if (!deleted) {
@@ -476,13 +481,14 @@ public class KVStoreStateMachine extends StateMachineAdapter {
             return;
         }
 
-        // 从 MVCCStore 获取刚生成的 revision
+        // 从 MVCCStore 获取刚生成的 revision（getModRevision 包含 tombstone）
         MVCCStore.Revision modRev = mvccStore.getModRevision(key);
         long modRevValue = (modRev != null) ? modRev.getMainRev() : 0;
 
         // 触发 Watch 通知（使用带 try-catch 的 publishWatchEvent，防止 Watch 异常影响 onApply）
         if (watchManager != null) {
-            WatchEvent event = WatchEvent.delete(key, modRevValue);
+            // etcd 语义：DELETE 事件包含 key 的 createRevision 和删除后的 version
+            WatchEvent event = WatchEvent.delete(key, modRevValue, createRevBefore, versionBefore + 1);
             publishWatchEvent(event);
         }
     }
@@ -940,7 +946,8 @@ public class KVStoreStateMachine extends StateMachineAdapter {
         // 生成 Watch 事件
         publishWatchEvent(WatchEvent.put(key, value, mainRev, createRevision, version));
 
-        return TxnResponse.OpResult.success(Operation.OpType.PUT, key, version, mainRev);
+        return TxnResponse.OpResult.success(Operation.OpType.PUT, key, version, mainRev,
+                                             createRevision, mainRev);
     }
 
     /**
@@ -953,7 +960,12 @@ public class KVStoreStateMachine extends StateMachineAdapter {
                                                      int subRev) {
         // etcd 事务语义：所有操作共享同一个 mainRev，通过 subRev 区分顺序
         MVCCStore.Revision txnRev = new MVCCStore.Revision(mainRev, subRev);
-        
+
+        // 获取删除前的版本信息（用于返回 createRevision 和 Watch 事件）
+        MVCCStore.KeyVersion keyVersion = mvccStore.getKeyVersion(key);
+        long createRevision = (keyVersion != null) ? keyVersion.createRevision : 0;
+        long versionBefore = (keyVersion != null) ? keyVersion.version : 0;
+
         // 使用指定的 revision 删除（不生成新的 revision）
         mvccStore.deleteWithRevision(key, txnRev);
 
@@ -961,10 +973,11 @@ public class KVStoreStateMachine extends StateMachineAdapter {
         txnContext.put(key, null);  // null 表示已删除
         txnVersionContext.remove(key);
 
-        // 生成 Watch 事件
-        publishWatchEvent(WatchEvent.delete(key, mainRev));
+        // 生成 Watch 事件（etcd 语义：包含 createRevision 和删除后的 version）
+        publishWatchEvent(WatchEvent.delete(key, mainRev, createRevision, versionBefore + 1));
 
-        return TxnResponse.OpResult.success(Operation.OpType.DELETE, key, 0, mainRev);
+        return TxnResponse.OpResult.success(Operation.OpType.DELETE, key, 0, mainRev,
+                                             createRevision, mainRev);
     }
 
     /**
@@ -981,12 +994,15 @@ public class KVStoreStateMachine extends StateMachineAdapter {
 
             if (value == null) {
                 // 在事务中被删除了，revision 为当前事务的 mainRev
-                return TxnResponse.OpResult.getSuccess(key, null, 0, txnMainRev);
+                long delCreateRev = (keyVersion != null) ? keyVersion.createRevision : 0;
+                return TxnResponse.OpResult.getSuccess(key, null, 0, txnMainRev, delCreateRev, txnMainRev);
             }
 
             long version = (keyVersion != null) ? keyVersion.version : 0;
             long revision = (keyVersion != null) ? keyVersion.modRevision : txnMainRev;
-            return TxnResponse.OpResult.getSuccess(key, value, version, revision);
+            long createRevision = (keyVersion != null) ? keyVersion.createRevision : 0;
+            long modRevision = (keyVersion != null) ? keyVersion.modRevision : txnMainRev;
+            return TxnResponse.OpResult.getSuccess(key, value, version, revision, createRevision, modRevision);
         }
 
         // 从 MVCCStore 获取
@@ -996,8 +1012,10 @@ public class KVStoreStateMachine extends StateMachineAdapter {
 
         long version = (keyVersion != null) ? keyVersion.version : 0;
         long revision = (keyVersion != null) ? keyVersion.modRevision : txnMainRev;
+        long createRevision = (keyVersion != null) ? keyVersion.createRevision : 0;
+        long modRevision = (keyVersion != null) ? keyVersion.modRevision : txnMainRev;
 
-        return TxnResponse.OpResult.getSuccess(key, value, version, revision);
+        return TxnResponse.OpResult.getSuccess(key, value, version, revision, createRevision, modRevision);
     }
 
     /**

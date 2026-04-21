@@ -295,6 +295,15 @@ public class MVCCStore {
      * 获取 key 的当前版本号（修改次数）
      */
     public long getVersion(String key) {
+         // etcd 语义：如果 key 的最新记录是 tombstone，视为 key 不存在，version = 0
+        NavigableMap<Revision, KeyValue> history = keyIndex.get(key);
+        if (history == null || history.isEmpty()) {
+            return 0L;
+        }
+        KeyValue latest = history.lastEntry().getValue();
+        if (latest.isTombstone()) {
+            return 0L;
+        }
         return keyVersions.getOrDefault(key, 0L);
     }
 
@@ -304,11 +313,12 @@ public class MVCCStore {
      * 优化：从 keyIndex 的第一条记录派生，不再使用冗余的 keyCreateRevisions Map
      */
     public Revision getCreateRevision(String key) {
-        NavigableMap<Revision, KeyValue> history = keyIndex.get(key);
-        if (history == null || history.isEmpty()) {
-            return null;
-        }
-        return history.firstEntry().getValue().getCreateRevision();
+        // etcd 语义：createRevision 是 key 当前生命周期的创建版本号。
+        // 如果 key 被删除后重新创建，createRevision 会重置为新的值。
+        // 因此必须返回当前有效版本（getLatest）的 createRevision，
+        // 而不是历史第一条记录（firstEntry）的 createRevision。
+        KeyValue latest = getLatest(key);
+        return latest != null ? latest.getCreateRevision() : null;
     }
 
     /**
@@ -331,17 +341,26 @@ public class MVCCStore {
      * @return KeyVersion 对象，如果 key 不存在返回 null
      */
     public KeyVersion getKeyVersion(String key) {
-        Long version = keyVersions.get(key);
-        if (version == null) {
-            return null;
-        }
-
         NavigableMap<Revision, KeyValue> history = keyIndex.get(key);
         if (history == null || history.isEmpty()) {
             return null;
         }
 
-        Revision createRev = history.firstEntry().getValue().getCreateRevision();
+        // etcd 语义：如果 key 的最新记录是 tombstone，视为 key 不存在
+        KeyValue latest = history.lastEntry().getValue();
+        if (latest.isTombstone()) {
+            return null;
+        }
+
+        Long version = keyVersions.get(key);
+        if (version == null) {
+            return null;
+        }
+
+        // etcd 语义：createRevision 必须来自当前有效版本（latest），
+        // 而不是历史第一条记录（firstEntry）。
+        // 因为 key 可能被删除后重新创建，此时 createRevision 会重置。
+        Revision createRev = latest.getCreateRevision();
         Revision modRev = getModRevision(key);
 
         if (createRev == null || modRev == null) {
@@ -491,8 +510,9 @@ public class MVCCStore {
         NavigableMap<Revision, KeyValue> history = keyIndex.get(key);
 
         // 创建 tombstone（值为 null 表示删除）
-        // createRevision 从历史记录派生
-        Revision createRev = history.firstEntry().getValue().getCreateRevision();
+        // createRevision 必须从当前有效版本（latest）派生，而不是历史第一条（firstEntry）。
+        // 因为 key 可能被删除后重新创建，此时当前生命周期的 createRevision 已重置。
+        Revision createRev = latest.getCreateRevision();
         // 使用 ConcurrentHashMap.compute 原子递增版本号（与 putWithRevision 保持一致）
         long newVersion = keyVersions.compute(key, (k, v) -> (v == null) ? 1L : v + 1);
 
@@ -569,7 +589,8 @@ public class MVCCStore {
      * 获取存储统计信息
      */
     public StoreStats getStats() {
-        long totalKeys = keyIndex.size();
+        // etcd 语义：totalKeys 应统计当前有效 key（排除 tombstone）
+        long totalKeys = getKeyCount();
         long totalVersions = keyIndex.values().stream()
                 .mapToLong(NavigableMap::size)
                 .sum();
