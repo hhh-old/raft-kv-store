@@ -1,0 +1,24 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(cd /d D:\\\\project\\\\Claudecode\\\\raft-kv-store)",
+      "Bash(mvn compile:*)",
+      "Bash(mvn clean:*)",
+      "Bash(taskkill //F //IM java.exe)",
+      "Bash(rm -rf D:/project/Claudecode/raft-kv-store/data)",
+      "Bash(mkdir -p D:/project/Claudecode/raft-kv-store/data)",
+      "Bash(powershell -ExecutionPolicy Bypass -File start-cluster.ps1)",
+      "Bash(curl -s http://localhost:9081/raft/stats)",
+      "Bash(curl:*)",
+      "Bash(powershell -ExecutionPolicy Bypass -File comprehensive-test.ps1)",
+      "Bash(powershell -ExecutionPolicy Bypass -File test-txn-visibility.ps1)",
+      "Bash(powershell -ExecutionPolicy Bypass -File test-mvcc-occ.ps1)",
+      "Bash(powershell -ExecutionPolicy Bypass -File stress-test.ps1)",
+      "Bash(find D:/project/Claudecode/raft-kv-store -type f \\\\\\( -name \"*.java\" -o -name \"*.yml\" -o -name \"*.xml\" -o -name \"*.ps1\" -o -name \"*.md\" \\\\\\) ! -path \"*/target/*\" ! -path \"*/.claude/*\" -exec wc -l {} +)",
+      "Bash(find D:/project/Claudecode/raft-kv-store -name \"*.java\" ! -path \"*/target/*\" -exec cat {} \\\\;)",
+      "Bash(find D:/project/Claudecode/raft-kv-store -name \"*.yml\" -o -name \"*.xml\" ! -path \"*/target/*\" -exec cat {} \\\\;)",
+      "Bash(find D:/project/Claudecode/raft-kv-store -name \"*.ps1\" ! -path \"*/target/*\" -exec cat {} \\\\;)",
+      "Bash(find D:/project/Claudecode/raft-kv-store -name \"*.md\" ! -path \"*/target/*\" -exec cat {} \\\\;)"
+    ]
+  }
+}

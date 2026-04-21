@@ -1,15 +1,19 @@
-# Raft KV Store 与 etcd 功能差距分析
+# Raft KV Store 与 etcd 功能差距分析（2025-04-15 更新）
 
 ## 已实现功能
 
-| 功能 | 状态 | 说明 |
-|------|------|------|
-| 基本 KV 操作 | ✅ | PUT/GET/DELETE |
-| Raft 共识 | ✅ | SOFAJRaft 实现 |
-| Watch 机制 | ✅ | 支持精确匹配、前缀匹配、历史回放 |
-| 线性一致性读 | ✅ | ReadIndex 机制 |
-| 幂等性 | ✅ | 请求去重缓存 |
-| 快照 | ✅ | 自动快照和加载 |
+| 功能 | 状态 | 说明 | 与 etcd 对齐度 |
+|------|------|------|----------------|
+| 基本 KV 操作 | ✅ | PUT/GET/DELETE | 100% |
+| Raft 共识 | ✅ | SOFAJRaft 实现 | 100% |
+| Watch 机制 | ✅ | 支持精确匹配、前缀匹配、历史回放 | 90% |
+| 线性一致性读 | ✅ | ReadIndex 机制 | 100% |
+| 幂等性 | ✅ | 请求去重缓存 | 100% |
+| 快照 | ✅ | 自动快照和加载 | 100% |
+| **Transaction（事务）** | ✅ **新增** | 支持 compare-then-execute、多 key 原子操作 | 95% |
+| **MVCC 多版本** | ✅ **新增** | 支持历史版本查询、Revision 追踪 | 90% |
+| **乐观并发控制** | ✅ **新增** | 事务冲突检测、细粒度锁 | 90% |
+| **高级 Compare 操作符** | ✅ **新增** | EQUAL/GREATER/LESS/NOT_EQUAL/GREATER_EQUAL/LESS_EQUAL | 100% |
 
 ---
 
@@ -67,119 +71,77 @@ public class LeaseManager {
 
 ---
 
-### 2. Transaction（事务）⭐⭐⭐⭐⭐
+### 2. Transaction（事务）⭐⭐⭐⭐⭐ ✅ 已实现
 
 **重要性**：极高 - 实现分布式锁、CAS 操作的基础
 
-**功能描述**：
-- 支持原子性的多 key 操作
-- 支持条件判断（If-Then-Else）
-- 支持 compare-and-swap（CAS）
+**实现状态**：✅ **已完成（2025-04-15）**
 
-**使用场景**：
-```bash
-# 1. 分布式锁（安全实现）
-# 只有 key 不存在时才创建（原子操作）
-etcdctl txn <<<'
-mod("/lock/mylock") = "0"
+**已实现功能**：
+- ✅ 原子性多 key 操作
+- ✅ 条件判断（If-Then-Else）
+- ✅ compare-and-swap（CAS）
+- ✅ 6 种 Compare 操作符（EQUAL/GREATER/LESS/NOT_EQUAL/GREATER_EQUAL/LESS_EQUAL）
+- ✅ 事务内可见性（事务内 PUT 后 GET 能看到新值）
+- ✅ 乐观并发控制（OCC）
 
-# 如果 key 不存在
-put("/lock/mylock", "owner-123")
-
-# 否则
-get("/lock/mylock")
-'
-
-# 2. 配置原子更新
-# 只有当当前值等于预期值时才更新
-etcdctl txn <<<'
-value("/config/version") = "v1"
-
-put("/config/version", "v2")
-put("/config/data", "new-data")
-
-get("/config/version")
-'
-```
-
-**实现复杂度**：高
-- 需要扩展 Raft 日志条目类型
-- 需要实现条件判断逻辑
-- 需要保证整个事务的原子性
-
-**建议实现方案**：
+**使用示例**：
 ```java
-public class TransactionRequest {
-    private List<Compare> compares;      // 条件判断
-    private List<Operation> successOps;  // 成功时执行
-    private List<Operation> failureOps;  // 失败时执行
-}
+// 1. 分布式锁（安全实现）
+TxnRequest txn = TxnRequest.builder()
+    .compare(Compare.version("/lock/mylock", CompareOp.EQUAL, 0))
+    .success(Operation.put("/lock/mylock", "owner-123"))
+    .failure(Operation.get("/lock/mylock"))
+    .build();
 
-public enum CompareType {
-    VERSION,      // 版本号比较
-    CREATE,       // 创建版本比较
-    MOD,          // 修改版本比较
-    VALUE,        // 值比较
-}
-
-// 在 StateMachine 中处理
-public void onApply(TransactionRequest txn) {
-    boolean success = evaluateCompares(txn.getCompares());
-    if (success) {
-        txn.getSuccessOps().forEach(this::applyOperation);
-    } else {
-        txn.getFailureOps().forEach(this::applyOperation);
-    }
-}
+// 2. CAS 原子更新
+TxnRequest txn = TxnRequest.builder()
+    .compare(Compare.value("/config/version", CompareOp.EQUAL, "v1"))
+    .success(Operation.put("/config/version", "v2"))
+    .failure(Operation.get("/config/version"))
+    .build();
 ```
+
+**与 etcd 的差距**：
+- ✅ 功能完整度：95%
+- ⚠️ 缺少：OR 逻辑（当前只有 AND）
+- ⚠️ 缺少：范围比较（如 key > "/a" && key < "/z"）
 
 ---
 
-### 3. Multi-Version（多版本）⭐⭐⭐⭐
+### 3. MVCC 多版本存储 ⭐⭐⭐⭐ ✅ 已实现
 
 **重要性**：高 - 支持历史版本查询、回滚
 
-**功能描述**：
-- 每个 Key 保留多个历史版本
-- 支持查询指定版本的数据
-- 支持按版本号范围查询
+**实现状态**：✅ **已完成（2025-04-15）**
 
-**使用场景**：
-```bash
-# 1. 查询历史版本
-etcdctl get /config/app --rev=100  # 查询版本100时的值
+**已实现功能**：
+- ✅ 每个 Key 保留多个历史版本（TreeMap 存储）
+- ✅ 支持查询指定版本的数据（`getAtRevision`）
+- ✅ Revision 格式对齐 etcd（mainRev.subRev）
+- ✅ 支持版本号、创建版本、修改版本追踪
+- ✅ 乐观并发控制（OCC）冲突检测
+- ✅ 细粒度锁优化（无锁读、per-key 写锁）
 
-# 2. 查看修改历史
-etcdctl watch /config/app --rev=1  # 从版本1开始的所有变化
-
-# 3. 数据回滚
-etcdctl get /config/app --rev=100 | etcdctl put /config/app
-```
-
-**实现复杂度**：中
-- 修改 KV 存储结构，支持版本链
-- 需要版本清理机制（防止无限增长）
-
-**建议实现方案**：
+**使用示例**：
 ```java
-public class VersionedValue {
-    private String value;
-    private long createRevision;
-    private long modRevision;
-    private int version;  // 当前 key 的版本号（每次修改+1）
-    private long leaseId;
-}
+// 存储多个版本
+mvccStore.put("key", "value1");  // rev=1.0
+mvccStore.put("key", "value2");  // rev=2.0
+mvccStore.put("key", "value3");  // rev=3.0
 
-// 存储结构：key -> List<VersionedValue>
-private final Map<String, List<VersionedValue>> versionedStore = new ConcurrentHashMap<>();
+// 查询历史版本
+KeyValue kv = mvccStore.getAtRevision("key", 2);  // 返回 value2
 
-// 查询指定版本
-public String get(String key, long revision) {
-    List<VersionedValue> versions = versionedStore.get(key);
-    // 二分查找 <= revision 的最新版本
-    return binarySearch(versions, revision);
-}
+// 获取版本信息
+long version = mvccStore.getVersion("key");        // 返回 3
+Revision modRev = mvccStore.getModRevision("key"); // 返回 3.0
 ```
+
+**与 etcd 的差距**：
+- ✅ 功能完整度：90%
+- ⚠️ 缺少：自动压缩（Compaction）
+- ⚠️ 缺少：历史版本 TTL
 
 ---
 
@@ -377,12 +339,12 @@ etcdctl get /config/app --user=app-user:password
 
 ---
 
-## 功能实现优先级建议
+## 功能实现优先级建议（更新）
 
-### 第一阶段（核心功能）- 2-3 个月
-1. **Lease 机制** - 服务发现的基础
-2. **Transaction 事务** - 分布式锁的基础
-3. **Multi-Version** - 数据完整性的基础
+### 第一阶段（核心功能）✅ 已完成 2/3
+1. ~~Transaction 事务~~ ✅ **已完成** - 分布式锁的基础
+2. ~~MVCC 多版本~~ ✅ **已完成** - 数据完整性的基础
+3. **Lease 机制** ⏳ **待实现** - 服务发现的基础
 
 ### 第二阶段（生产必需）- 1-2 个月
 4. **Compaction** - 防止存储无限增长
@@ -417,16 +379,51 @@ CompactionManager     // 压缩管理
 
 ---
 
-## 总结
+## 总结（2025-04-15 更新）
 
-当前项目实现了 etcd 约 **40%** 的核心功能，主要差距在：
+当前项目实现了 etcd 约 **65%** 的核心功能，主要进展：
 
-| 功能类别 | 完成度 | 关键差距 |
-|----------|--------|----------|
-| 基础 KV | 90% | 缺少多版本 |
-| Watch | 80% | 缺少双向流 |
-| 高级功能 | 10% | 缺少 Lease、Transaction |
-| 运维管理 | 20% | 缺少动态扩缩容 |
-| 安全 | 0% | 缺少认证授权 |
+| 功能类别 | 完成度 | 关键进展 | 关键差距 |
+|----------|--------|----------|----------|
+| 基础 KV | 100% | ✅ MVCC 实现 | 无 |
+| Watch | 85% | ✅ 基础实现完善 | ⚠️ 缺少双向流（gRPC） |
+| 事务 | 95% | ✅ Compare-then-execute、OCC | ⚠️ 缺少 OR 逻辑 |
+| 并发控制 | 90% | ✅ 无锁读、细粒度锁、OCC | ⚠️ 缺少自动重试机制 |
+| 高级功能 | 30% | ✅ MVCC、事务 | ⏳ 缺少 Lease、Compaction |
+| 运维管理 | 20% | - | ⏳ 缺少动态扩缩容 |
+| 安全 | 0% | - | ⏳ 缺少认证授权 |
+
+### 已实现的核心特性
+
+```
+✅ 基础 KV 操作（PUT/GET/DELETE）
+✅ Raft 共识（SOFAJRaft）
+✅ Watch 机制（精确匹配、前缀匹配、历史回放）
+✅ 线性一致性读（ReadIndex）
+✅ 幂等性（请求去重）
+✅ 快照（自动保存/加载）
+✅ 事务（Transaction）- 2025-04-15 完成
+   - Compare-then-execute 语义
+   - 6 种 Compare 操作符
+   - 事务内可见性
+✅ MVCC 多版本存储 - 2025-04-15 完成
+   - Revision 追踪（mainRev.subRev）
+   - 历史版本查询
+   - 乐观并发控制（OCC）
+✅ 锁优化 - 2025-04-15 完成
+   - 无锁读（MVCC）
+   - 细粒度写锁（per-key）
+   - 事务乐观并发控制
+```
+
+### 与 etcd 的核心差距
+
+| 功能 | 状态 | 优先级 |
+|------|------|--------|
+| **Lease 机制** | ⏳ 未实现 | ⭐⭐⭐⭐⭐ |
+| **Compaction** | ⏳ 未实现 | ⭐⭐⭐⭐ |
+| **Cluster Membership** | ⏳ 未实现 | ⭐⭐⭐⭐ |
+| **Authentication** | ⏳ 未实现 | ⭐⭐⭐ |
+| **gRPC API** | ⏳ 未实现 | ⭐⭐⭐ |
 
 **建议下一步**：优先实现 **Lease 机制**，这是服务发现和分布式锁的基础，也是 etcd 最核心的特性之一。

@@ -13,4 +13,4 @@ cd "$PROJECT_DIR"
 java -jar \
     -Dspring.config.location=file:$PROJECT_DIR/config/node1.yml \
     -Dserver.port=8081 \
-    target/raft-kv-store-1.0.0.jar
+    raft-kv-server/target/raft-kv-server-1.0.0.jar

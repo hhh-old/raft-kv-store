@@ -5,12 +5,12 @@
     <modelVersion>4.0.0</modelVersion>
 
     <groupId>com.raftkv</groupId>
-    <artifactId>raft-kv-client</artifactId>
+    <artifactId>raft-kv-api</artifactId>
     <version>1.0.0</version>
     <packaging>jar</packaging>
 
-    <name>Raft KV Store Client</name>
-    <description>Java Client for Raft KV Store with idempotency and auto-retry</description>
+    <name>Raft KV Store API</name>
+    <description>Shared API entities and contracts for Raft KV Store</description>
 
     <properties>
         <java.version>17</java.version>
@@ -20,33 +20,11 @@
     </properties>
 
     <dependencies>
-        <!-- Shared API module -->
-        <dependency>
-            <groupId>com.raftkv</groupId>
-            <artifactId>raft-kv-api</artifactId>
-            <version>1.0.0</version>
-        </dependency>
-
-        <!-- Jackson for JSON -->
+        <!-- Jackson for JSON serialization -->
         <dependency>
             <groupId>com.fasterxml.jackson.core</groupId>
             <artifactId>jackson-databind</artifactId>
             <version>2.15.0</version>
-        </dependency>
-
-        <!-- HTTP Client (Java 11+ built-in) -->
-        <!-- No external dependency needed -->
-
-        <!-- SLF4J + Logback for logging -->
-        <dependency>
-            <groupId>org.slf4j</groupId>
-            <artifactId>slf4j-api</artifactId>
-            <version>2.0.9</version>
-        </dependency>
-        <dependency>
-            <groupId>ch.qos.logback</groupId>
-            <artifactId>logback-classic</artifactId>
-            <version>1.4.11</version>
         </dependency>
 
         <!-- Lombok -->
@@ -55,14 +33,6 @@
             <artifactId>lombok</artifactId>
             <version>1.18.30</version>
             <optional>true</optional>
-        </dependency>
-
-        <!-- JUnit for testing -->
-        <dependency>
-            <groupId>org.junit.jupiter</groupId>
-            <artifactId>junit-jupiter</artifactId>
-            <version>5.10.0</version>
-            <scope>test</scope>
         </dependency>
     </dependencies>
 
