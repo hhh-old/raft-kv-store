@@ -242,12 +242,10 @@ public class MVCCStore {
         NavigableMap<Revision, KeyValue> history = keyIndex.computeIfAbsent(key,
                 k -> new ConcurrentSkipListMap<>());
 
-        // 使用 ConcurrentHashMap.compute 原子递增版本号
-        long newVersion = keyVersions.compute(key, (k, v) -> (v == null) ? 1L : v + 1);
-
         // 计算 createRevision（对齐 etcd 语义）
         // etcd: tombstone 标志着 key 生命周期的终结，重新 PUT 是全新 key
         Revision createRev;
+        boolean isRecreated = false;
         if (history.isEmpty()) {
             // 新 key：createRevision = 当前 revision
             createRev = rev;
@@ -257,10 +255,21 @@ public class MVCCStore {
             if (latestKv.isTombstone()) {
                 // 已删除后重新创建：createRevision = 当前 revision（新生命周期）
                 createRev = rev;
+                isRecreated = true;
             } else {
                 // 正常更新：createRevision 保持不变
                 createRev = latestKv.getCreateRevision();
             }
+        }
+
+        // 计算 version（对齐 etcd 语义）
+        // etcd: key 被删除后重新创建，version 从 1 开始（新生命周期）
+        long newVersion;
+        if (isRecreated) {
+            newVersion = 1L;
+            keyVersions.put(key, 1L);
+        } else {
+            newVersion = keyVersions.compute(key, (k, v) -> (v == null) ? 1L : v + 1);
         }
 
         // 存储新版本
