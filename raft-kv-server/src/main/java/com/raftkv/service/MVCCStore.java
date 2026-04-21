@@ -183,25 +183,20 @@ public class MVCCStore {
     // ==================== 读写操作 ====================
 
     /**
-     * 获取 key 的最新有效值（跳过 tombstone，对齐 etcd 语义）
+     * 获取 key 的最新有效值（对齐 etcd 语义）
      *
-     * etcd 行为：GET 请求不返回已删除的 key
-     * 实现：从最新版本向前遍历，跳过 tombstone（value==null）
-     * 如果所有版本都是 tombstone（理论上只有 compact 后才会出现），返回 null
+     * etcd 行为：GET 请求只看最新一条记录。
+     * - 如果最新记录是 tombstone（删除标记），key 视为不存在，返回 null
+     * - 如果最新记录是有效值，返回该值
+     *
+     * 注意：不向前遍历跳过 tombstone。 Tombstone 是"不存在"的声明，不是可跳过的旧版本。
      */
     public KeyValue getLatest(String key) {
-        NavigableMap<Revision, KeyValue> history = keyIndex.get(key);
-        if (history == null || history.isEmpty()) {
+        KeyValue kv = getLatestIncludingTombstone(key);
+        if (kv != null && kv.isTombstone()) {
             return null;
         }
-        // 从最新版本向前遍历，跳过 tombstone
-        for (Map.Entry<Revision, KeyValue> entry : history.descendingMap().entrySet()) {
-            if (!entry.getValue().isTombstone()) {
-                return entry.getValue();
-            }
-        }
-        // 所有版本都是 tombstone，视为 key 不存在
-        return null;
+        return kv;
     }
 
     /**
