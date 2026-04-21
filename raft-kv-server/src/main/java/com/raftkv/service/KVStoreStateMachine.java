@@ -192,9 +192,8 @@ public class KVStoreStateMachine extends StateMachineAdapter {
      * 获取 key 数量 - MVCC 无锁读优化
      */
     public int getKeyCount() {
-        // 从 MVCCStore 获取（无锁）
-        MVCCStore.StoreStats stats = mvccStore.getStats();
-        return (int) stats.getTotalKeys();
+        // 从 MVCCStore 获取（排除 tombstone，对齐 etcd 语义）
+        return (int) mvccStore.getKeyCount();
     }
 
     /**
@@ -470,13 +469,17 @@ public class KVStoreStateMachine extends StateMachineAdapter {
      * 应用 DELETE 操作 - 使用 MVCCStore 细粒度锁
      */
     private void applyDeleteMVCC(String key) {
-        // MVCCStore.delete() 内部会生成 revision，不需要在这里生成
-        mvccStore.delete(key);
-        
+        // MVCCStore.delete() 返回 false 表示 key 不存在或已删除
+        boolean deleted = mvccStore.delete(key);
+        if (!deleted) {
+            LOG.debug("DELETE skipped: key={} does not exist or already deleted", key);
+            return;
+        }
+
         // 从 MVCCStore 获取刚生成的 revision
         MVCCStore.Revision modRev = mvccStore.getModRevision(key);
         long modRevValue = (modRev != null) ? modRev.getMainRev() : 0;
-        
+
         // 触发 Watch 通知（使用带 try-catch 的 publishWatchEvent，防止 Watch 异常影响 onApply）
         if (watchManager != null) {
             WatchEvent event = WatchEvent.delete(key, modRevValue);
@@ -717,6 +720,17 @@ public class KVStoreStateMachine extends StateMachineAdapter {
                             response.setValue((String) respMap.get("value"));
                             response.setRequestId((String) respMap.get("requestId"));
                             response.setError((String) respMap.get("error"));
+                            response.setServedBy((String) respMap.get("servedBy"));
+                            response.setLeaderEndpoint((String) respMap.get("leaderEndpoint"));
+                            // 恢复 found 字段：如果快照中有则使用，否则根据 value 推断
+                            Boolean found = (Boolean) respMap.get("found");
+                            if (found != null) {
+                                response.setFound(found);
+                            } else {
+                                // 兼容旧快照：value 非 null 表示 found=true（key 存在）
+                                // NOT_LEADER 响应 value 可能非 null 但 found 应该为 null
+                                response.setFound(response.getValue() != null);
+                            }
                             processedRequests.put(entry.getKey(), response);
                         }
                     }
@@ -747,66 +761,34 @@ public class KVStoreStateMachine extends StateMachineAdapter {
      * @return 事务响应
      */
     public TxnResponse executeTransaction(TxnRequest txnRequest) {
-        try {
-            // 1. 评估所有 compare 条件
-            boolean allConditionsMet = evaluateCompares(txnRequest.getCompares());
-
-            // 2. 根据条件结果选择执行的操作列表
-            java.util.List<Operation> opsToExecute = allConditionsMet
-                    ? txnRequest.getSuccess()
-                    : txnRequest.getFailure();
-
-            // 3. 判断是否是只读事务（没有 PUT/DELETE 操作）
-            boolean isReadOnly = opsToExecute.stream()
-                    .allMatch(op -> op.getType() == Operation.OpType.GET || op.getType() == Operation.OpType.TXN);
-
-            // 4. 生成事务共享的 mainRev（etcd 语义：只读事务不消耗 revision）
-            long txnMainRev;
-            if (isReadOnly) {
-                // 只读事务：使用当前 revision，不生成新的
-                txnMainRev = mvccStore.getCurrentRevision();
-                LOG.debug("Read-only transaction, using current revision: {}", txnMainRev);
-            } else {
-                // 读写事务：生成新的 revision
-                txnMainRev = mvccStore.generateRevision().getMainRev();
-                LOG.debug("Read-write transaction, generated new revision: {}", txnMainRev);
-            }
-
-            // 5. 执行操作列表（支持事务内可见性，共享 mainRev）
-            java.util.Map<Integer, TxnResponse.OpResult> results = new java.util.HashMap<>();
-            java.util.Map<String, String> txnContext = new java.util.HashMap<>();
-            java.util.Map<String, MVCCStore.KeyVersion> txnVersionContext = new java.util.HashMap<>();
-
-            for (int i = 0; i < opsToExecute.size(); i++) {
-                Operation op = opsToExecute.get(i);
-                // 每个操作使用相同的 mainRev，但不同的 subRev（从 0 开始递增）
-                TxnResponse.OpResult result = executeOperationWithContext(op, txnContext, txnVersionContext, txnMainRev, i);
-                results.put(i, result);
-            }
-
-            // 6. 构建响应
-            if (allConditionsMet) {
-                return TxnResponse.success(opsToExecute, results);
-            } else {
-                return TxnResponse.failure(opsToExecute, results);
-            }
-
-        } catch (Exception e) {
-            LOG.error("Failed to execute transaction", e);
-            return TxnResponse.error("Transaction failed: " + e.getMessage());
-        }
+        // 顶层事务：创建全新的事务上下文
+        java.util.Map<String, String> txnContext = new java.util.HashMap<>();
+        java.util.Map<String, MVCCStore.KeyVersion> txnVersionContext = new java.util.HashMap<>();
+        return executeTransactionWithContext(txnRequest, txnContext, txnVersionContext, -1, 0);
     }
 
     /**
-     * 评估所有 compare 条件（从 MVCCStore 无锁读取）
+     * 评估所有 compare 条件（基础版本，无事务上下文）
      */
     private boolean evaluateCompares(java.util.List<Compare> compares) {
+        return evaluateComparesWithContext(compares, null, null);
+    }
+
+    /**
+     * 评估所有 compare 条件（支持事务上下文）
+     *
+     * 嵌套事务中，Compare 必须能看到外层事务的修改。
+     * 因此优先从 txnContext / txnVersionContext 读取，不存在时再回退到 MVCCStore。
+     */
+    private boolean evaluateComparesWithContext(java.util.List<Compare> compares,
+                                                 java.util.Map<String, String> txnContext,
+                                                 java.util.Map<String, MVCCStore.KeyVersion> txnVersionContext) {
         if (compares == null || compares.isEmpty()) {
             return true;
         }
 
         for (Compare compare : compares) {
-            if (!evaluateCompare(compare)) {
+            if (!evaluateCompareWithContext(compare, txnContext, txnVersionContext)) {
                 return false;
             }
         }
@@ -814,30 +796,55 @@ public class KVStoreStateMachine extends StateMachineAdapter {
     }
 
     /**
-     * 评估单个 compare 条件（从 MVCCStore 无锁读取）
+     * 评估单个 compare 条件（支持事务上下文）
      */
-    private boolean evaluateCompare(Compare compare) {
+    private boolean evaluateCompareWithContext(Compare compare,
+                                                java.util.Map<String, String> txnContext,
+                                                java.util.Map<String, MVCCStore.KeyVersion> txnVersionContext) {
         String key = compare.getKey();
         Compare.CompareType target = compare.getTarget();
         Compare.CompareOp op = compare.getOp();
         Object expectedValue = compare.getValue();
 
-        // 从 MVCCStore 读取（无锁）
+        // 判断该 key 是否在事务上下文中被修改过
+        boolean inTxnContext = txnContext != null && txnContext.containsKey(key);
+
         switch (target) {
             case VERSION:
-                long version = mvccStore.getVersion(key);
+                long version;
+                if (inTxnContext && txnVersionContext != null && txnVersionContext.containsKey(key)) {
+                    version = txnVersionContext.get(key).version;
+                } else {
+                    version = mvccStore.getVersion(key);
+                }
                 return compareLong(version, op, ((Number) expectedValue).longValue());
             case CREATE:
-                MVCCStore.Revision createRev = mvccStore.getCreateRevision(key);
-                long createRevValue = (createRev != null) ? createRev.getMainRev() : 0;
+                long createRevValue;
+                if (inTxnContext && txnVersionContext != null && txnVersionContext.containsKey(key)) {
+                    createRevValue = txnVersionContext.get(key).createRevision;
+                } else {
+                    MVCCStore.Revision createRev = mvccStore.getCreateRevision(key);
+                    createRevValue = (createRev != null) ? createRev.getMainRev() : 0;
+                }
                 return compareLong(createRevValue, op, ((Number) expectedValue).longValue());
             case MOD:
-                MVCCStore.Revision modRev = mvccStore.getModRevision(key);
-                long modRevValue = (modRev != null) ? modRev.getMainRev() : 0;
+                long modRevValue;
+                if (inTxnContext && txnVersionContext != null && txnVersionContext.containsKey(key)) {
+                    modRevValue = txnVersionContext.get(key).modRevision;
+                } else {
+                    MVCCStore.Revision modRev = mvccStore.getModRevision(key);
+                    modRevValue = (modRev != null) ? modRev.getMainRev() : 0;
+                }
                 return compareLong(modRevValue, op, ((Number) expectedValue).longValue());
             case VALUE:
-                MVCCStore.KeyValue kv = mvccStore.getLatest(key);
-                String actualValue = (kv != null) ? kv.getValue() : null;
+                String actualValue;
+                if (inTxnContext) {
+                    // 事务上下文中：null 表示已删除，非 null 表示值
+                    actualValue = txnContext.get(key);
+                } else {
+                    MVCCStore.KeyValue kv = mvccStore.getLatest(key);
+                    actualValue = (kv != null) ? kv.getValue() : null;
+                }
                 return compareValue(actualValue, op, (String) expectedValue);
             default:
                 LOG.warn("Unknown compare target: {}", target);
@@ -965,19 +972,20 @@ public class KVStoreStateMachine extends StateMachineAdapter {
      */
     private TxnResponse.OpResult executeGetInTxn(String key,
                                                   java.util.Map<String, String> txnContext,
-                                                  java.util.Map<String, MVCCStore.KeyVersion> txnVersionContext) {
+                                                  java.util.Map<String, MVCCStore.KeyVersion> txnVersionContext,
+                                                  long txnMainRev) {
         // 优先从事务上下文获取（事务内可见性）
         if (txnContext.containsKey(key)) {
             String value = txnContext.get(key);
             MVCCStore.KeyVersion keyVersion = txnVersionContext.get(key);
 
             if (value == null) {
-                // 在事务中被删除了
-                return TxnResponse.OpResult.getSuccess(key, null, 0, getCurrentRevision());
+                // 在事务中被删除了，revision 为当前事务的 mainRev
+                return TxnResponse.OpResult.getSuccess(key, null, 0, txnMainRev);
             }
 
             long version = (keyVersion != null) ? keyVersion.version : 0;
-            long revision = (keyVersion != null) ? keyVersion.modRevision : getCurrentRevision();
+            long revision = (keyVersion != null) ? keyVersion.modRevision : txnMainRev;
             return TxnResponse.OpResult.getSuccess(key, value, version, revision);
         }
 
@@ -987,7 +995,7 @@ public class KVStoreStateMachine extends StateMachineAdapter {
         MVCCStore.KeyVersion keyVersion = mvccStore.getKeyVersion(key);
 
         long version = (keyVersion != null) ? keyVersion.version : 0;
-        long revision = (keyVersion != null) ? keyVersion.modRevision : getCurrentRevision();
+        long revision = (keyVersion != null) ? keyVersion.modRevision : txnMainRev;
 
         return TxnResponse.OpResult.getSuccess(key, value, version, revision);
     }
@@ -1017,7 +1025,7 @@ public class KVStoreStateMachine extends StateMachineAdapter {
             case DELETE:
                 return executeDeleteInTxn(key, txnContext, txnVersionContext, mainRev, subRev);
             case GET:
-                return executeGetInTxn(key, txnContext, txnVersionContext);
+                return executeGetInTxn(key, txnContext, txnVersionContext, mainRev);
             case TXN:
                 // 嵌套事务 - 传递上下文和 revision
                 TxnResponse nestedResponse = executeTransactionWithContext(op.getNestedTxn(), txnContext, txnVersionContext, mainRev, subRev);
@@ -1039,27 +1047,45 @@ public class KVStoreStateMachine extends StateMachineAdapter {
     private TxnResponse executeTransactionWithContext(TxnRequest txnRequest,
                                                        java.util.Map<String, String> txnContext,
                                                        java.util.Map<String, MVCCStore.KeyVersion> txnVersionContext,
-                                                       long mainRev,
+                                                       long parentMainRev,
                                                        int subRevBase) {
         try {
-            // 1. 评估所有 compare 条件
-            boolean allConditionsMet = evaluateCompares(txnRequest.getCompares());
+            // 1. 评估所有 compare 条件（使用事务上下文，保证嵌套事务能看到外层修改）
+            boolean allConditionsMet = evaluateComparesWithContext(
+                    txnRequest.getCompares(), txnContext, txnVersionContext);
 
             // 2. 根据条件结果选择执行的操作列表
             java.util.List<Operation> opsToExecute = allConditionsMet
                     ? txnRequest.getSuccess()
                     : txnRequest.getFailure();
 
-            // 3. 执行操作列表（使用传入的上下文和共享的 mainRev）
+            // 3. 判断是否是只读事务（没有 PUT/DELETE 操作）
+            boolean isReadOnly = opsToExecute.stream()
+                    .allMatch(op -> op.getType() == Operation.OpType.GET || op.getType() == Operation.OpType.TXN);
+
+            // 4. 生成事务共享的 mainRev（etcd 语义：只读事务不消耗 revision）
+            long txnMainRev;
+            if (isReadOnly) {
+                // 只读事务：使用当前 revision，不生成新的
+                txnMainRev = mvccStore.getCurrentRevision();
+                LOG.debug("Read-only transaction, using current revision: {}", txnMainRev);
+            } else {
+                // 读写事务：生成新的 revision
+                txnMainRev = mvccStore.generateRevision().getMainRev();
+                LOG.debug("Read-write transaction, generated new revision: {}", txnMainRev);
+            }
+
+            // 5. 执行操作列表（使用传入的上下文和共享的 mainRev）
             java.util.Map<Integer, TxnResponse.OpResult> results = new java.util.HashMap<>();
             for (int i = 0; i < opsToExecute.size(); i++) {
                 Operation op = opsToExecute.get(i);
                 // 每个操作使用相同的 mainRev，但不同的 subRev（递增）
-                TxnResponse.OpResult result = executeOperationWithContext(op, txnContext, txnVersionContext, mainRev, subRevBase + i);
+                TxnResponse.OpResult result = executeOperationWithContext(
+                        op, txnContext, txnVersionContext, txnMainRev, subRevBase + i);
                 results.put(i, result);
             }
 
-            // 4. 构建响应
+            // 6. 构建响应
             if (allConditionsMet) {
                 return TxnResponse.success(opsToExecute, results);
             } else {
