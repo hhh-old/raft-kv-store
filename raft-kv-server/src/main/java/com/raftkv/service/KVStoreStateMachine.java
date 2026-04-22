@@ -1058,7 +1058,26 @@ public class KVStoreStateMachine extends StateMachineAdapter {
 
     /**
      * 执行事务（支持外部上下文）- 用于嵌套事务
-     * 
+     *
+     *
+     * txnContext 和 txnVersionContext 扮演着**“事务本地缓存”**（或称为“工作内存 / Working Memory”）的角色。
+     * 它们的核心作用是：解决事务内部（尤其是嵌套事务）的“读自己之写”（Read-Your-Own-Writes）问题，并维护事务执行期间的临时版本状态。
+     *
+     * txnContext 详解
+     * 数据结构：Map<String, String> (Key -> Value)
+     * 存储内容：记录当前事务运行到目前为止，修改过的 Key 的最新值。
+     * 如何工作：
+     *  写入（PUT）：当事务中执行了 PUT A = "hello"，代码不仅会写 MVCCStore，还会执行 txnContext.put("A", "hello")。
+     *  删除（DELETE）：当事务中执行了 DELETE A，会执行 txnContext.put("A", null)（用 null 表示已删除/Tombstone）。
+     *  读取（GET/COMPARE）：当事务中需要比较或获取 A 的值时，代码会先检查 inTxnContext（即 txnContext.containsKey("A")）。如果存在，直接拿 txnContext 里的值，这就屏蔽了底层的 MVCCStore，直接看到了当前事务自己刚刚修改的值。
+     *
+     * txnVersionContext 详解
+     * 数据结构：Map<String, MVCCStore.KeyVersion>
+     * 存储内容：记录当前事务运行到目前为止，修改过的 Key 的元数据信息（版本号信息）。包括 createRevision（创建版本）、modRevision（修改版本）和 version（被修改的次数）。
+     * 如何工作：
+     *  当在事务中执行 PUT 时，代码会计算出这个 Key 新的 version 和 createRevision，并连同当前事务的 mainRev 一起封装成 KeyVersion，存入 txnVersionContext。
+     *  后续如果是基于版本的 COMPARE 操作（如 CompareType.VERSION），就会优先从 txnVersionContext 中拿取刚刚计算出的临时版本号进行比对。
+     *
      * @param mainRev 事务共享的主版本号（etcd 语义：一个事务内所有操作共享同一个 mainRev）
      * @param subRevBase 子版本号起始值，用于区分同一事务内不同操作的顺序
      */

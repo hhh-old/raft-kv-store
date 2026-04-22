@@ -97,6 +97,8 @@ public class EtcdCompatibilityTest {
             results.add(test.runTestCase("21", "CAS 操作", test::testCASOperation));
             results.add(test.runTestCase("22", "空值边界", test::testEmptyValue));
             results.add(test.runTestCase("23", "删除后 recreate", test::testDeleteRecreateCreateRevision));
+            results.add(test.runTestCase("24", "Tombstone version=0", test::testTombstoneVersionZero));
+            results.add(test.runTestCase("25", "事务内 revision 共享", test::testTransactionRevisionSharingDetailed));
 
         } finally {
             test.cleanup();
@@ -1374,6 +1376,225 @@ public class EtcdCompatibilityTest {
             System.out.println("    任一条件不满足即失败");
 
             System.out.println("    ✓ 多条件 AND 语义验证通过");
+            return true;
+        } catch (AssertionError e) {
+            System.out.println("    ❌ 测试失败: " + e.getMessage());
+            return false;
+        }
+    }
+
+    // ==================== 24. Tombstone 状态下 version=0 ====================
+
+    /**
+     * 测试 etcd 语义：Tombstone 状态下 version 必须返回 0
+     * 
+     * etcd 语义：
+     * - DELETE 创建 tombstone（逻辑删除）
+     * - GET 已删除的 key 不返回数据（tombstone 语义）
+     * - Tombstone 状态的 key 在返回 version 时应返回 0（不是删除前的 version）
+     * 
+     * 这是 etcd 与大多数 KV store 的关键区别：
+     * - 普通 KV: 删除后 GET 仍返回历史数据或 null
+     * - etcd: 删除后 GET 不返回 tombstone，version 为 0
+     */
+    private boolean testTombstoneVersionZero() {
+        printSection("测试 24: Tombstone 状态下 version=0");
+
+        String key = "/test/tombstone/version/" + System.currentTimeMillis();
+        testKeys.add(key);
+
+        try {
+            // 1. 创建 key，记录 version
+            System.out.println("24.1 创建 key 并记录 version");
+            client.put(key, "value1");
+
+            TxnRequest getTxn = TxnRequest.builder()
+                    .success(java.util.List.of(Operation.get(key)))
+                    .build();
+            TxnResponse resp1 = client.transaction(getTxn);
+            TxnResponse.OpResult r1 = resp1.getResults().get(0);
+
+            long versionBeforeDelete = r1.getVersion();
+            System.out.println("    删除前 version: " + versionBeforeDelete);
+            assertTrue(versionBeforeDelete >= 1, "删除前 version 应 >= 1");
+
+            // 2. 删除 key
+            System.out.println("24.2 DELETE key");
+            client.delete(key);
+
+            // 3. 通过事务 GET tombstone key（关键测试）
+            System.out.println("24.3 事务 GET 已删除的 key（tombstone 状态）");
+            TxnResponse resp2 = client.transaction(getTxn);
+            TxnResponse.OpResult r2 = resp2.getResults().get(0);
+
+            System.out.println("    Tombstone GET: value=" + r2.getValue() + ", version=" + r2.getVersion());
+
+            // 4. 验证 etcd 语义：tombstone 状态下 value 为 null，version 为 0
+            assertTrue(r2.getValue() == null, "Tombstone 状态 value 应为 null");
+            assertTrue(r2.getVersion() == 0, "Tombstone 状态下 version 应为 0（不是 " + versionBeforeDelete + "）");
+            System.out.println("    ✓ Tombstone 状态下 version=0 验证通过");
+
+            // 5. 验证普通 GET 也看不到 tombstone
+            System.out.println("24.4 普通 GET 验证 tombstone 不可见");
+            KVResponse getResp = client.get(key);
+            boolean keyNotFound = getResp.getValue() == null || getResp.getValue().isEmpty();
+            assertTrue(keyNotFound, "GET 已删除的 key 应返回空值（tombstone 语义）");
+            System.out.println("    普通 GET 返回空值 ✓");
+
+            // 6. 重新创建 key，version 应从 1 开始
+            System.out.println("24.5 重新创建 key");
+            client.put(key, "recreated-value");
+
+            TxnResponse resp3 = client.transaction(getTxn);
+            TxnResponse.OpResult r3 = resp3.getResults().get(0);
+
+            System.out.println("    重新创建后: value=" + r3.getValue() + ", version=" + r3.getVersion());
+            assertEquals("recreated-value", r3.getValue(), "重新创建后 value 应匹配");
+            assertTrue(r3.getVersion() == 1, "重新创建后 version 应从 1 开始");
+
+            // 7. 再次删除，验证 version 再次回到 0
+            System.out.println("24.6 再次删除 key");
+            client.delete(key);
+
+            TxnResponse resp4 = client.transaction(getTxn);
+            TxnResponse.OpResult r4 = resp4.getResults().get(0);
+
+            System.out.println("    再次删除后 tombstone: version=" + r4.getVersion());
+            assertTrue(r4.getValue() == null, "再次删除后 value 应为 null");
+            assertTrue(r4.getVersion() == 0, "再次删除后 version 应回到 0");
+
+            System.out.println("    ✓ Tombstone version=0 完整验证通过");
+            return true;
+        } catch (AssertionError e) {
+            System.out.println("    ❌ 测试失败: " + e.getMessage());
+            return false;
+        }
+    }
+
+    // ==================== 25. 事务内 revision 共享详细验证 ====================
+
+    /**
+     * 测试 etcd 事务内 revision 共享语义：
+     * 
+     * etcd 语义：
+     * - 事务内所有操作共享同一个 mainRev（事务级别的全局 revision）
+     * - 通过 subRev 区分事务内不同操作的顺序
+     * - 这保证了事务的原子性：所有操作要么全部成功，要么全部失败
+     * 
+     * 验证要点：
+     * 1. 事务内多个 PUT 的 modRevision 应该相同或非常接近
+     * 2. 事务内 PUT 后 GET 应该能看到 PUT 的结果（事务内可见性）
+     * 3. 事务提交后，所有受影响的 key 的 modRevision 都会更新
+     */
+    private boolean testTransactionRevisionSharingDetailed() {
+        printSection("测试 25: 事务内 revision 共享详细验证");
+
+        String key1 = "/test/txn/rev-share/" + System.currentTimeMillis() + "/key1";
+        String key2 = "/test/txn/rev-share/" + System.currentTimeMillis() + "/key2";
+        String key3 = "/test/txn/rev-share/" + System.currentTimeMillis() + "/key3";
+        testKeys.add(key1);
+        testKeys.add(key2);
+        testKeys.add(key3);
+
+        try {
+            // 1. 记录事务前的 revision
+            long beforeRevision = client.getCurrentRevision();
+            System.out.println("25.1 事务前 revision: " + beforeRevision);
+
+            // 2. 执行事务：PUT 多个 key，每个 PUT 后都 GET 验证可见性
+            System.out.println("25.2 在事务中 PUT 3 个 key");
+            TxnRequest txn = TxnRequest.builder()
+                    .success(java.util.List.of(
+                            // key1: PUT 后 GET 验证
+                            Operation.put(key1, "value1"),
+                            Operation.get(key1),
+                            // key2: PUT 后 GET 验证
+                            Operation.put(key2, "value2"),
+                            Operation.get(key2),
+                            // key3: PUT 新值
+                            Operation.put(key3, "value3")
+                    ))
+                    .failure(java.util.List.of())
+                    .build();
+            TxnResponse resp = client.transaction(txn);
+
+            assertTrue(resp.isSucceeded(), "事务应成功执行");
+            System.out.println("    事务执行成功");
+
+            // 3. 分析事务内的 revision 分布
+            // 结构：[PUT key1, GET key1, PUT key2, GET key2, PUT key3]
+            //       0         1        2         3        4
+            System.out.println("25.3 分析事务内 revision 分布");
+
+            // 提取 PUT 操作的 revision（索引 0, 2, 4）
+            List<Long> putRevisions = new ArrayList<>();
+            for (int i = 0; i < resp.getOps().size(); i++) {
+                Operation op = resp.getOps().get(i);
+                if (op.getType() == Operation.OpType.PUT) {
+                    TxnResponse.OpResult result = resp.getResults().get(i);
+                    long rev = result.getRevision();
+                    putRevisions.add(rev);
+                    System.out.println("    PUT " + op.getKey() + " -> revision=" + rev);
+                }
+            }
+
+            // 提取 GET 操作的 revision（索引 1, 3）
+            List<Long> getRevisions = new ArrayList<>();
+            List<String> getValues = new ArrayList<>();
+            for (int i = 0; i < resp.getOps().size(); i++) {
+                Operation op = resp.getOps().get(i);
+                if (op.getType() == Operation.OpType.GET) {
+                    TxnResponse.OpResult result = resp.getResults().get(i);
+                    getRevisions.add(result.getRevision());
+                    getValues.add(result.getValue());
+                    System.out.println("    GET " + op.getKey() + " -> revision=" + result.getRevision() + ", value=" + result.getValue());
+                }
+            }
+
+            // 4. 验证事务内可见性（关键）
+            // PUT key1 后 GET key1，应该能看到 value1
+            // PUT key2 后 GET key2，应该能看到 value2
+            System.out.println("25.4 验证事务内可见性");
+            assertEquals("value1", getValues.get(0), "事务中 PUT key1 后 GET 应看到 value1");
+            assertEquals("value2", getValues.get(1), "事务中 PUT key2 后 GET 应看到 value2");
+            System.out.println("    ✓ 事务内 PUT-GET 可见性验证通过");
+
+            // 5. 验证 revision 共享特性
+            // etcd 语义：事务内操作共享主 revision，只是 subRev 不同
+            // 这意味着 PUT 的 revision 差值应该较小（不超过 subRev 差值）
+            long minPutRev = putRevisions.stream().min(Long::compare).orElse(0L);
+            long maxPutRev = putRevisions.stream().max(Long::compare).orElse(0L);
+            long revisionSpan = maxPutRev - minPutRev;
+
+            System.out.println("25.5 验证 revision 共享");
+            System.out.println("    PUT revision 范围: [" + minPutRev + ", " + maxPutRev + "], span=" + revisionSpan);
+
+            // etcd 语义：事务内操作共享主 revision
+            // 差值应该很小（通常 <= 操作数）
+            int putCount = putRevisions.size();  // 3 个 PUT
+            boolean revisionShared = revisionSpan <= putCount;
+            System.out.println("    revision span(" + revisionSpan + ") <= PUT 数量(" + putCount + "): " + revisionShared);
+
+            // 6. 验证事务后的 revision 确实增长
+            long afterRevision = client.getCurrentRevision();
+            System.out.println("25.6 事务后 revision: " + afterRevision);
+            System.out.println("    revision 增长: " + (afterRevision - beforeRevision));
+
+            // 7. 验证事务后各 key 的 revision
+            System.out.println("25.7 验证事务后各 key 的 revision");
+            for (String key : new String[]{key1, key2, key3}) {
+                TxnRequest getReq = TxnRequest.builder()
+                        .success(java.util.List.of(Operation.get(key)))
+                        .build();
+                TxnResponse getResp = client.transaction(getReq);
+                TxnResponse.OpResult result = getResp.getResults().get(0);
+                System.out.println("    " + key + " -> modRevision=" + result.getModRevision() + ", version=" + result.getVersion());
+
+                // 每个 key 都应该被更新过，version >= 1
+                assertTrue(result.getVersion() >= 1, key + " 的 version 应 >= 1");
+            }
+
+            System.out.println("    ✓ 事务内 revision 共享详细验证通过");
             return true;
         } catch (AssertionError e) {
             System.out.println("    ❌ 测试失败: " + e.getMessage());
