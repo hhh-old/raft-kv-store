@@ -794,7 +794,7 @@ public class KVStoreStateMachine extends StateMachineAdapter {
         // 顶层事务：创建全新的事务上下文
         java.util.Map<String, String> txnContext = new java.util.HashMap<>();
         java.util.Map<String, MVCCStore.KeyVersion> txnVersionContext = new java.util.HashMap<>();
-        return executeTransactionWithContext(txnRequest, txnContext, txnVersionContext, -1, 0);
+        return executeTransactionWithContext(txnRequest, txnContext, txnVersionContext);
     }
 
     /**
@@ -807,8 +807,8 @@ public class KVStoreStateMachine extends StateMachineAdapter {
     /**
      * 评估所有 compare 条件（支持事务上下文）
      *
-     * 嵌套事务中，Compare 必须能看到外层事务的修改。
-     * 因此优先从 txnContext / txnVersionContext 读取，不存在时再回退到 MVCCStore。
+     * Compare 优先从 txnContext / txnVersionContext 读取（事务内可见性），
+     * 不存在时再回退到 MVCCStore。
      */
     private boolean evaluateComparesWithContext(java.util.List<Compare> compares,
                                                  java.util.Map<String, String> txnContext,
@@ -1068,24 +1068,16 @@ public class KVStoreStateMachine extends StateMachineAdapter {
                 return executeDeleteInTxn(key, txnContext, txnVersionContext, mainRev, subRev);
             case GET:
                 return executeGetInTxn(key, txnContext, txnVersionContext, mainRev);
-            case TXN:
-                // 嵌套事务 - 传递上下文和 revision
-                TxnResponse nestedResponse = executeTransactionWithContext(op.getNestedTxn(), txnContext, txnVersionContext, mainRev, subRev);
-                return TxnResponse.OpResult.builder()
-                        .success(nestedResponse.isSucceeded())
-                        .type(Operation.OpType.TXN)
-                        .build();
             default:
                 return TxnResponse.OpResult.failure(op.getType(), key, "Unknown operation type");
         }
     }
 
     /**
-     * 执行事务（支持外部上下文）- 用于嵌套事务
+     * 执行事务（支持事务上下文）
      *
-     *
-     * txnContext 和 txnVersionContext 扮演着**“事务本地缓存”**（或称为“工作内存 / Working Memory”）的角色。
-     * 它们的核心作用是：解决事务内部（尤其是嵌套事务）的“读自己之写”（Read-Your-Own-Writes）问题，并维护事务执行期间的临时版本状态。
+     * txnContext 和 txnVersionContext 扮演着**"事务本地缓存"**（或称为"工作内存 / Working Memory"）的角色。
+     * 它们的核心作用是：解决事务内部的"读自己之写"（Read-Your-Own-Writes）问题，并维护事务执行期间的临时版本状态。
      *
      * txnContext 详解
      * 数据结构：Map<String, String> (Key -> Value)
@@ -1101,17 +1093,12 @@ public class KVStoreStateMachine extends StateMachineAdapter {
      * 如何工作：
      *  当在事务中执行 PUT 时，代码会计算出这个 Key 新的 version 和 createRevision，并连同当前事务的 mainRev 一起封装成 KeyVersion，存入 txnVersionContext。
      *  后续如果是基于版本的 COMPARE 操作（如 CompareType.VERSION），就会优先从 txnVersionContext 中拿取刚刚计算出的临时版本号进行比对。
-     *
-     * @param mainRev 事务共享的主版本号（etcd 语义：一个事务内所有操作共享同一个 mainRev）
-     * @param subRevBase 子版本号起始值，用于区分同一事务内不同操作的顺序
      */
     private TxnResponse executeTransactionWithContext(TxnRequest txnRequest,
                                                        java.util.Map<String, String> txnContext,
-                                                       java.util.Map<String, MVCCStore.KeyVersion> txnVersionContext,
-                                                       long parentMainRev,
-                                                       int subRevBase) {
+                                                       java.util.Map<String, MVCCStore.KeyVersion> txnVersionContext) {
         try {
-            // 1. 评估所有 compare 条件（使用事务上下文，保证嵌套事务能看到外层修改）
+            // 1. 评估所有 compare 条件
             boolean allConditionsMet = evaluateComparesWithContext(
                     txnRequest.getCompares(), txnContext, txnVersionContext);
 
@@ -1122,7 +1109,7 @@ public class KVStoreStateMachine extends StateMachineAdapter {
 
             // 3. 判断是否是只读事务（没有 PUT/DELETE 操作）
             boolean isReadOnly = opsToExecute.stream()
-                    .allMatch(op -> op.getType() == Operation.OpType.GET || op.getType() == Operation.OpType.TXN);
+                    .allMatch(op -> op.getType() == Operation.OpType.GET);
 
             // 4. 生成事务共享的 mainRev（etcd 语义：只读事务不消耗 revision）
             long txnMainRev;
@@ -1136,13 +1123,12 @@ public class KVStoreStateMachine extends StateMachineAdapter {
                 LOG.debug("Read-write transaction, generated new revision: {}", txnMainRev);
             }
 
-            // 5. 执行操作列表（使用传入的上下文和共享的 mainRev）
+            // 5. 执行操作列表（每个操作使用相同的 mainRev，通过 subRev 区分顺序）
             java.util.Map<Integer, TxnResponse.OpResult> results = new java.util.HashMap<>();
             for (int i = 0; i < opsToExecute.size(); i++) {
                 Operation op = opsToExecute.get(i);
-                // 每个操作使用相同的 mainRev，但不同的 subRev（递增）
                 TxnResponse.OpResult result = executeOperationWithContext(
-                        op, txnContext, txnVersionContext, txnMainRev, subRevBase + i);
+                        op, txnContext, txnVersionContext, txnMainRev, i);
                 results.put(i, result);
             }
 
@@ -1154,8 +1140,8 @@ public class KVStoreStateMachine extends StateMachineAdapter {
             }
 
         } catch (Exception e) {
-            LOG.error("Failed to execute nested transaction", e);
-            return TxnResponse.error("Nested transaction failed: " + e.getMessage());
+            LOG.error("Transaction execution failed", e);
+            return TxnResponse.error("Transaction failed: " + e.getMessage());
         }
     }
 }

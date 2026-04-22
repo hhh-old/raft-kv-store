@@ -29,9 +29,8 @@ import java.util.concurrent.CopyOnWriteArrayList;
  * 8. 幂等性 - requestId 去重
  * 9. 线性一致性 - ReadIndex 机制
  * 10. 分布式锁 - CAS 实现
- * 11. 嵌套事务 Compare 可见性
- * 12. CAS 操作
- * 13. 空值边界测试
+ * 11. CAS 操作
+ * 12. 空值边界测试
  * 
  * 运行方式：
  * 1. 启动三个 Raft 节点
@@ -87,18 +86,16 @@ public class EtcdCompatibilityTest {
             results.add(test.runTestCase("11", "幂等性", test::testIdempotency));
             results.add(test.runTestCase("12", "线性一致性读", test::testLinearizableRead));
             results.add(test.runTestCase("13", "分布式锁", test::testDistributedLock));
-            results.add(test.runTestCase("14", "嵌套事务", test::testNestedTransaction));
-            results.add(test.runTestCase("15", "MVCC 精确值验证", test::testMVCCPreciseValues));
-            results.add(test.runTestCase("16", "Watch DELETE 事件", test::testWatchDeleteEvent));
-            results.add(test.runTestCase("17", "事务 Compare MOD/CREATE", test::testTransactionCompareModCreate));
-            results.add(test.runTestCase("18", "事务多条件 AND", test::testTransactionMultiCompare));
-            results.add(test.runTestCase("19", "事务内 DELETE 可见性", test::testTransactionDeleteVisibility));
-            results.add(test.runTestCase("20", "嵌套事务 Compare 可见性", test::testNestedTransactionCompareVisibility));
-            results.add(test.runTestCase("21", "CAS 操作", test::testCASOperation));
-            results.add(test.runTestCase("22", "空值边界", test::testEmptyValue));
-            results.add(test.runTestCase("23", "删除后 recreate", test::testDeleteRecreateCreateRevision));
-            results.add(test.runTestCase("24", "Tombstone version=0", test::testTombstoneVersionZero));
-            results.add(test.runTestCase("25", "事务内 revision 共享", test::testTransactionRevisionSharingDetailed));
+            results.add(test.runTestCase("14", "MVCC 精确值验证", test::testMVCCPreciseValues));
+            results.add(test.runTestCase("15", "Watch DELETE 事件", test::testWatchDeleteEvent));
+            results.add(test.runTestCase("16", "事务 Compare MOD/CREATE", test::testTransactionCompareModCreate));
+            results.add(test.runTestCase("17", "事务多条件 AND", test::testTransactionMultiCompare));
+            results.add(test.runTestCase("18", "事务内 DELETE 可见性", test::testTransactionDeleteVisibility));
+            results.add(test.runTestCase("19", "CAS 操作", test::testCASOperation));
+            results.add(test.runTestCase("20", "空值边界", test::testEmptyValue));
+            results.add(test.runTestCase("21", "删除后 recreate", test::testDeleteRecreateCreateRevision));
+            results.add(test.runTestCase("22", "Tombstone version=0", test::testTombstoneVersionZero));
+            results.add(test.runTestCase("23", "事务内 revision 共享", test::testTransactionRevisionSharingDetailed));
 
         } finally {
             test.cleanup();
@@ -1015,64 +1012,8 @@ public class EtcdCompatibilityTest {
         }
     }
     
-    // ==================== 14. 嵌套事务测试 ====================
+    // ==================== 14. MVCC 精确值验证 ====================
     
-    /**
-     * 测试嵌套事务：
-     * - etcd 支持 TXN 类型的嵌套操作
-     */
-    private boolean testNestedTransaction() {
-        printSection("测试 14: 嵌套事务");
-        
-        String key1 = "/test/nested/key1-" + System.currentTimeMillis();
-        String key2 = "/test/nested/key2-" + System.currentTimeMillis();
-        testKeys.add(key1);
-        testKeys.add(key2);
-        
-        try {
-            // 初始化
-            client.put(key1, "initial1");
-            client.put(key2, "initial2");
-            
-            // 创建嵌套事务
-            System.out.println("14.1 创建嵌套事务");
-            TxnRequest nestedTxn = TxnRequest.builder()
-                    .success(java.util.List.of(
-                            Operation.put(key1, "outer-put"),
-                            // 嵌套一个只读事务
-                            Operation.txn(TxnRequest.builder()
-                                    .success(java.util.List.of(
-                                            Operation.get(key2)
-                                    ))
-                                    .failure(java.util.List.of())
-                                    .build()),
-                            Operation.get(key1)
-                    ))
-                    .failure(java.util.List.of())
-                    .build();
-            
-            TxnResponse resp = client.transaction(nestedTxn);
-            
-            System.out.println("14.2 嵌套事务结果");
-            System.out.println("    事务执行: " + (resp.isSucceeded() ? "成功" : "失败"));
-            
-            // 验证结果
-            if (resp.isSucceeded()) {
-                String finalValue = client.get(key1).getValue();
-                System.out.println("    最终值: " + finalValue);
-            }
-            
-            return true;
-        } catch (Exception e) {
-            System.out.println("    ⚠ 嵌套事务测试遇到问题: " + e.getMessage());
-            // 嵌套事务可能不是所有版本都支持，返回 true 但给出提示
-            System.out.println("    ✓ 嵌套事务测试完成（非关键功能）");
-            return true;
-        }
-    }
-    
-    // ==================== 15. MVCC 精确值验证 ====================
-
     /**
      * 测试 MVCC 精确值验证：
      * - createRevision: key 首次创建时的全局 revision，之后不变
@@ -1225,14 +1166,14 @@ public class EtcdCompatibilityTest {
      * - CREATE: 比较 key 的创建 revision
      */
     private boolean testTransactionCompareModCreate() {
-        printSection("测试 17: 事务 Compare MOD/CREATE revision");
+        printSection("测试 16: 事务 Compare MOD/CREATE revision");
 
         String key = "/test/txn/mod-create/" + System.currentTimeMillis();
         testKeys.add(key);
 
         try {
             // 1. 创建 key，获取 createRevision
-            System.out.println("17.1 创建 key");
+            System.out.println("16.1 创建 key");
             client.put(key, "initial");
 
             TxnRequest getTxn = TxnRequest.builder()
@@ -1246,7 +1187,7 @@ public class EtcdCompatibilityTest {
             System.out.println("    createRevision=" + createRev + ", modRevision=" + modRev);
 
             // 2. 测试 MOD EQUAL（条件满足）
-            System.out.println("17.2 测试 MOD EQUAL（条件满足）");
+            System.out.println("16.2 测试 MOD EQUAL（条件满足）");
             TxnRequest txn1 = TxnRequest.builder()
                     .compares(java.util.List.of(Compare.mod(key, CompareOp.EQUAL, modRev)))
                     .success(java.util.List.of(Operation.put(key, "mod-equal-passed")))
@@ -1257,7 +1198,7 @@ public class EtcdCompatibilityTest {
             System.out.println("    MOD EQUAL 满足");
 
             // 3. 测试 MOD EQUAL（条件不满足）
-            System.out.println("17.3 测试 MOD EQUAL（条件不满足）");
+            System.out.println("16.3 测试 MOD EQUAL（条件不满足）");
             TxnRequest txn2 = TxnRequest.builder()
                     .compares(java.util.List.of(Compare.mod(key, CompareOp.EQUAL, modRev)))
                     .success(java.util.List.of(Operation.put(key, "should-not-update")))
@@ -1268,7 +1209,7 @@ public class EtcdCompatibilityTest {
             System.out.println("    MOD EQUAL 不满足（modRevision 已变化）");
 
             // 4. 测试 CREATE EQUAL（应始终满足，因为 createRevision 不变）
-            System.out.println("17.4 测试 CREATE EQUAL（应始终满足）");
+            System.out.println("16.4 测试 CREATE EQUAL（应始终满足）");
             TxnRequest txn3 = TxnRequest.builder()
                     .compares(java.util.List.of(Compare.create(key, CompareOp.EQUAL, createRev)))
                     .success(java.util.List.of(Operation.put(key, "create-equal-passed")))
@@ -1279,7 +1220,7 @@ public class EtcdCompatibilityTest {
             System.out.println("    CREATE EQUAL 满足（createRevision 始终不变）");
 
             // 5. 测试 CREATE GREATER（key 不存在时）
-            System.out.println("17.5 测试 CREATE GREATER（新 key）");
+            System.out.println("16.5 测试 CREATE GREATER（新 key）");
             String newKey = "/test/txn/mod-create/new/" + System.currentTimeMillis();
             testKeys.add(newKey);
             TxnRequest txn4 = TxnRequest.builder()
@@ -1309,7 +1250,7 @@ public class EtcdCompatibilityTest {
      * - 任一条件不满足则执行 failure
      */
     private boolean testTransactionMultiCompare() {
-        printSection("测试 18: 事务多条件 AND 语义");
+        printSection("测试 17: 事务多条件 AND 语义");
 
         String key1 = "/test/txn/multi/" + System.currentTimeMillis() + "/key1";
         String key2 = "/test/txn/multi/" + System.currentTimeMillis() + "/key2";
@@ -1318,14 +1259,14 @@ public class EtcdCompatibilityTest {
 
         try {
             // 1. 初始化数据
-            System.out.println("18.1 初始化数据");
+            System.out.println("17.1 初始化数据");
             client.put(key1, "value1");
             client.put(key2, "value2");
             System.out.println("    PUT " + key1 + " = value1");
             System.out.println("    PUT " + key2 + " = value2");
 
             // 2. 两个条件都满足
-            System.out.println("18.2 两个条件都满足");
+            System.out.println("17.2 两个条件都满足");
             TxnRequest txn1 = TxnRequest.builder()
                     .compares(java.util.List.of(
                             Compare.value(key1, CompareOp.EQUAL, "value1"),
@@ -1342,7 +1283,7 @@ public class EtcdCompatibilityTest {
             System.out.println("    两个条件满足，执行 success");
 
             // 3. 第一个条件满足，第二个不满足
-            System.out.println("18.3 第一个满足，第二个不满足");
+            System.out.println("17.3 第一个满足，第二个不满足");
             TxnRequest txn2 = TxnRequest.builder()
                     .compares(java.util.List.of(
                             Compare.value(key1, CompareOp.EQUAL, "both-passed"),
@@ -1362,7 +1303,7 @@ public class EtcdCompatibilityTest {
             System.out.println("    条件不满足，执行 failure");
 
             // 4. 第一个条件不满足，第二个满足
-            System.out.println("18.4 第一个不满足，第二个满足");
+            System.out.println("17.4 第一个不满足，第二个满足");
             TxnRequest txn3 = TxnRequest.builder()
                     .compares(java.util.List.of(
                             Compare.value(key1, CompareOp.EQUAL, "wrong-value"),
@@ -1398,14 +1339,14 @@ public class EtcdCompatibilityTest {
      * - etcd: 删除后 GET 不返回 tombstone，version 为 0
      */
     private boolean testTombstoneVersionZero() {
-        printSection("测试 24: Tombstone 状态下 version=0");
+        printSection("测试 22: Tombstone 状态下 version=0");
 
         String key = "/test/tombstone/version/" + System.currentTimeMillis();
         testKeys.add(key);
 
         try {
             // 1. 创建 key，记录 version
-            System.out.println("24.1 创建 key 并记录 version");
+            System.out.println("22.1 创建 key 并记录 version");
             client.put(key, "value1");
 
             TxnRequest getTxn = TxnRequest.builder()
@@ -1419,11 +1360,11 @@ public class EtcdCompatibilityTest {
             assertTrue(versionBeforeDelete >= 1, "删除前 version 应 >= 1");
 
             // 2. 删除 key
-            System.out.println("24.2 DELETE key");
+            System.out.println("22.2 DELETE key");
             client.delete(key);
 
             // 3. 通过事务 GET tombstone key（关键测试）
-            System.out.println("24.3 事务 GET 已删除的 key（tombstone 状态）");
+            System.out.println("22.3 事务 GET 已删除的 key（tombstone 状态）");
             TxnResponse resp2 = client.transaction(getTxn);
             TxnResponse.OpResult r2 = resp2.getResults().get(0);
 
@@ -1435,14 +1376,14 @@ public class EtcdCompatibilityTest {
             System.out.println("    ✓ Tombstone 状态下 version=0 验证通过");
 
             // 5. 验证普通 GET 也看不到 tombstone
-            System.out.println("24.4 普通 GET 验证 tombstone 不可见");
+            System.out.println("22.4 普通 GET 验证 tombstone 不可见");
             KVResponse getResp = client.get(key);
             boolean keyNotFound = getResp.getValue() == null || getResp.getValue().isEmpty();
             assertTrue(keyNotFound, "GET 已删除的 key 应返回空值（tombstone 语义）");
             System.out.println("    普通 GET 返回空值 ✓");
 
             // 6. 重新创建 key，version 应从 1 开始
-            System.out.println("24.5 重新创建 key");
+            System.out.println("22.5 重新创建 key");
             client.put(key, "recreated-value");
 
             TxnResponse resp3 = client.transaction(getTxn);
@@ -1453,7 +1394,7 @@ public class EtcdCompatibilityTest {
             assertTrue(r3.getVersion() == 1, "重新创建后 version 应从 1 开始");
 
             // 7. 再次删除，验证 version 再次回到 0
-            System.out.println("24.6 再次删除 key");
+            System.out.println("22.6 再次删除 key");
             client.delete(key);
 
             TxnResponse resp4 = client.transaction(getTxn);
@@ -1487,7 +1428,7 @@ public class EtcdCompatibilityTest {
      * 3. 事务提交后，所有受影响的 key 的 modRevision 都会更新
      */
     private boolean testTransactionRevisionSharingDetailed() {
-        printSection("测试 25: 事务内 revision 共享详细验证");
+        printSection("测试 23: 事务内 revision 共享详细验证");
 
         String key1 = "/test/txn/rev-share/" + System.currentTimeMillis() + "/key1";
         String key2 = "/test/txn/rev-share/" + System.currentTimeMillis() + "/key2";
@@ -1499,10 +1440,10 @@ public class EtcdCompatibilityTest {
         try {
             // 1. 记录事务前的 revision
             long beforeRevision = client.getCurrentRevision();
-            System.out.println("25.1 事务前 revision: " + beforeRevision);
+            System.out.println("23.1 事务前 revision: " + beforeRevision);
 
             // 2. 执行事务：PUT 多个 key，每个 PUT 后都 GET 验证可见性
-            System.out.println("25.2 在事务中 PUT 3 个 key");
+            System.out.println("23.2 在事务中 PUT 3 个 key");
             TxnRequest txn = TxnRequest.builder()
                     .success(java.util.List.of(
                             // key1: PUT 后 GET 验证
@@ -1524,7 +1465,7 @@ public class EtcdCompatibilityTest {
             // 3. 分析事务内的 revision 分布
             // 结构：[PUT key1, GET key1, PUT key2, GET key2, PUT key3]
             //       0         1        2         3        4
-            System.out.println("25.3 分析事务内 revision 分布");
+            System.out.println("23.3 分析事务内 revision 分布");
 
             // 提取 PUT 操作的 revision（索引 0, 2, 4）
             List<Long> putRevisions = new ArrayList<>();
@@ -1554,7 +1495,7 @@ public class EtcdCompatibilityTest {
             // 4. 验证事务内可见性（关键）
             // PUT key1 后 GET key1，应该能看到 value1
             // PUT key2 后 GET key2，应该能看到 value2
-            System.out.println("25.4 验证事务内可见性");
+            System.out.println("23.4 验证事务内可见性");
             assertEquals("value1", getValues.get(0), "事务中 PUT key1 后 GET 应看到 value1");
             assertEquals("value2", getValues.get(1), "事务中 PUT key2 后 GET 应看到 value2");
             System.out.println("    ✓ 事务内 PUT-GET 可见性验证通过");
@@ -1566,7 +1507,7 @@ public class EtcdCompatibilityTest {
             long maxPutRev = putRevisions.stream().max(Long::compare).orElse(0L);
             long revisionSpan = maxPutRev - minPutRev;
 
-            System.out.println("25.5 验证 revision 共享");
+            System.out.println("23.5 验证 revision 共享");
             System.out.println("    PUT revision 范围: [" + minPutRev + ", " + maxPutRev + "], span=" + revisionSpan);
 
             // etcd 语义：事务内操作共享主 revision
@@ -1577,11 +1518,11 @@ public class EtcdCompatibilityTest {
 
             // 6. 验证事务后的 revision 确实增长
             long afterRevision = client.getCurrentRevision();
-            System.out.println("25.6 事务后 revision: " + afterRevision);
+            System.out.println("23.6 事务后 revision: " + afterRevision);
             System.out.println("    revision 增长: " + (afterRevision - beforeRevision));
 
             // 7. 验证事务后各 key 的 revision
-            System.out.println("25.7 验证事务后各 key 的 revision");
+            System.out.println("23.7 验证事务后各 key 的 revision");
             for (String key : new String[]{key1, key2, key3}) {
                 TxnRequest getReq = TxnRequest.builder()
                         .success(java.util.List.of(Operation.get(key)))
@@ -1609,19 +1550,19 @@ public class EtcdCompatibilityTest {
      * - 事务中 DELETE 一个 key 后，同一事务中的 GET 应返回空
      */
     private boolean testTransactionDeleteVisibility() {
-        printSection("测试 19: 事务内 DELETE 可见性");
+        printSection("测试 18: 事务内 DELETE 可见性");
 
         String key = "/test/txn/delete-vis/" + System.currentTimeMillis();
         testKeys.add(key);
 
         try {
             // 1. 初始化数据
-            System.out.println("19.1 初始化数据");
+            System.out.println("18.1 初始化数据");
             client.put(key, "value");
             System.out.println("    PUT " + key + " = value");
 
             // 2. 事务中 DELETE 后 GET
-            System.out.println("19.2 事务中 DELETE 后 GET");
+            System.out.println("18.2 事务中 DELETE 后 GET");
             TxnRequest txn = TxnRequest.builder()
                     .success(java.util.List.of(
                             Operation.delete(key),
@@ -1639,7 +1580,7 @@ public class EtcdCompatibilityTest {
             assertTrue(getResult.getVersion() == 0, "DELETE 后 version 应为 0");
 
             // 3. 验证事务外也看不到
-            System.out.println("19.3 验证事务外 GET");
+            System.out.println("18.3 验证事务外 GET");
             KVResponse outsideGet = client.get(key);
             assertTrue(outsideGet.getValue() == null || outsideGet.getValue().isEmpty(), "事务外也应看不到");
             System.out.println("    事务外 GET: value=" + outsideGet.getValue());
@@ -1652,63 +1593,7 @@ public class EtcdCompatibilityTest {
         }
     }
 
-    // ==================== 20. 嵌套事务 Compare 可见性 ====================
-
-    /**
-     * 测试嵌套事务中的 Compare 能看到外层事务的修改：
-     * - 外层事务 PUT key
-     * - 嵌套事务 Compare 这个 key（应满足）
-     */
-    private boolean testNestedTransactionCompareVisibility() {
-        printSection("测试 20: 嵌套事务 Compare 可见性");
-
-        String key = "/test/nested/compare-vis/" + System.currentTimeMillis();
-        testKeys.add(key);
-
-        try {
-            // 外层事务 PUT 一个 key，嵌套事务 Compare 这个 key
-            System.out.println("20.1 外层 PUT，嵌套 Compare");
-            TxnRequest nestedTxn = TxnRequest.builder()
-                    .compares(java.util.List.of(
-                            Compare.value(key, CompareOp.EQUAL, "outer-value")
-                    ))
-                    .success(java.util.List.of(
-                            Operation.put(key, "nested-success")
-                    ))
-                    .failure(java.util.List.of())
-                    .build();
-
-            TxnRequest outerTxn = TxnRequest.builder()
-                    .success(java.util.List.of(
-                            Operation.put(key, "outer-value"),
-                            Operation.txn(nestedTxn),
-                            Operation.get(key)
-                    ))
-                    .failure(java.util.List.of())
-                    .build();
-
-            TxnResponse resp = client.transaction(outerTxn);
-            assertTrue(resp.isSucceeded(), "外层事务应成功");
-
-            // 检查嵌套事务是否执行了 success（即 Compare 看到了外层 PUT）
-            TxnResponse.OpResult nestedResult = resp.getResults().get(1);
-            System.out.println("    嵌套事务结果: success=" + nestedResult.isSuccess());
-
-            // 嵌套事务 Compare 应满足，执行了 success，最终值为 "nested-success"
-            String finalValue = client.get(key).getValue();
-            System.out.println("    最终值: " + finalValue);
-
-            assertEquals("nested-success", finalValue, "嵌套事务应执行 success 分支更新值");
-
-            System.out.println("    ✓ 嵌套事务 Compare 可见性验证通过");
-            return true;
-        } catch (AssertionError e) {
-            System.out.println("    ❌ 测试失败: " + e.getMessage());
-            return false;
-        }
-    }
-
-    // ==================== 21. CAS 操作测试 ====================
+    // ==================== 20. CAS 操作测试 ====================
 
     /**
      * 测试 CAS（Compare-And-Swap）操作：
@@ -1716,33 +1601,33 @@ public class EtcdCompatibilityTest {
      * - 值不匹配时不更新
      */
     private boolean testCASOperation() {
-        printSection("测试 21: CAS 操作");
+        printSection("测试 19: CAS 操作");
 
         String key = "/test/cas/" + System.currentTimeMillis();
         testKeys.add(key);
 
         try {
             // 1. 初始化数据
-            System.out.println("21.1 初始化数据");
+            System.out.println("19.1 初始化数据");
             client.put(key, "original");
             System.out.println("    PUT " + key + " = original");
 
             // 2. CAS 成功（值匹配）
-            System.out.println("21.2 CAS 成功（值匹配）");
+            System.out.println("19.2 CAS 成功（值匹配）");
             TxnResponse resp1 = client.cas(key, "original", "swapped");
             assertTrue(resp1.isSucceeded(), "CAS 应成功");
             assertEquals("swapped", client.get(key).getValue(), "值应被更新");
             System.out.println("    CAS 成功，值更新为 swapped");
 
             // 3. CAS 失败（值不匹配）
-            System.out.println("21.3 CAS 失败（值不匹配）");
+            System.out.println("19.3 CAS 失败（值不匹配）");
             TxnResponse resp2 = client.cas(key, "wrong-value", "should-not-update");
             assertFalse(resp2.isSucceeded(), "CAS 应失败");
             assertEquals("swapped", client.get(key).getValue(), "值不应被更新");
             System.out.println("    CAS 失败，值保持 swapped");
 
             // 4. CAS with version
-            System.out.println("21.4 CAS with version");
+            System.out.println("19.4 CAS with version");
             TxnRequest getTxn = TxnRequest.builder()
                     .success(java.util.List.of(Operation.get(key)))
                     .build();
@@ -1777,14 +1662,14 @@ public class EtcdCompatibilityTest {
      * - GET 应返回空字符串（不是 null）
      */
     private boolean testEmptyValue() {
-        printSection("测试 22: 空值边界测试");
+        printSection("测试 20: 空值边界测试");
 
         String key = "/test/empty/" + System.currentTimeMillis();
         testKeys.add(key);
 
         try {
             // 1. PUT 空字符串
-            System.out.println("22.1 PUT 空字符串");
+            System.out.println("20.1 PUT 空字符串");
             client.put(key, "");
             KVResponse getResp = client.get(key);
             System.out.println("    GET 结果: value='" + getResp.getValue() + "', found=" + getResp.getFound());
@@ -1793,7 +1678,7 @@ public class EtcdCompatibilityTest {
             assertTrue(getResp.getFound() != null && getResp.getFound(), "空字符串 value 的 key 应存在");
 
             // 2. 通过事务 GET 验证
-            System.out.println("22.2 事务 GET 空字符串");
+            System.out.println("20.2 事务 GET 空字符串");
             TxnRequest txn = TxnRequest.builder()
                     .success(java.util.List.of(Operation.get(key)))
                     .build();
@@ -1805,7 +1690,7 @@ public class EtcdCompatibilityTest {
             assertTrue(result.getVersion() == 1, "version 应为 1");
 
             // 3. 更新为空字符串再验证 version
-            System.out.println("22.3 再次 PUT 空字符串（version 应递增）");
+            System.out.println("20.3 再次 PUT 空字符串（version 应递增）");
             client.put(key, "");
             TxnResponse resp2 = client.transaction(txn);
             TxnResponse.OpResult result2 = resp2.getResults().get(0);
@@ -1828,14 +1713,14 @@ public class EtcdCompatibilityTest {
      * - 删除后重新创建：createRevision = Y（Y > X）
      */
     private boolean testDeleteRecreateCreateRevision() {
-        printSection("测试 23: 删除后 recreate 的 createRevision 变化");
+        printSection("测试 21: 删除后 recreate 的 createRevision 变化");
 
         String key = "/test/recreate/" + System.currentTimeMillis();
         testKeys.add(key);
 
         try {
             // 1. 首次创建，获取 createRevision
-            System.out.println("23.1 首次创建 key");
+            System.out.println("21.1 首次创建 key");
             client.put(key, "v1");
 
             TxnRequest getTxn = TxnRequest.builder()
@@ -1847,17 +1732,17 @@ public class EtcdCompatibilityTest {
             System.out.println("    首次: createRevision=" + createRev1 + ", modRevision=" + modRev1);
 
             // 2. 删除 key
-            System.out.println("23.2 删除 key");
+            System.out.println("21.2 删除 key");
             client.delete(key);
 
             // 3. 验证 GET 返回空
-            System.out.println("23.3 验证删除后 GET");
+            System.out.println("21.3 验证删除后 GET");
             KVResponse getResp = client.get(key);
             assertTrue(getResp.getValue() == null || getResp.getValue().isEmpty(), "删除后应返回空");
             System.out.println("    删除后 GET: value=" + getResp.getValue());
 
             // 4. 重新创建同名 key
-            System.out.println("23.4 重新创建同名 key");
+            System.out.println("21.4 重新创建同名 key");
             client.put(key, "v2");
 
             TxnResponse resp2 = client.transaction(getTxn);
@@ -1876,7 +1761,7 @@ public class EtcdCompatibilityTest {
 
             // 7. 关键验证：Compare.CREATE 必须使用当前生命周期的 createRevision
             // 用旧的 createRevision 比较应该失败（已失效）
-            System.out.println("23.5 验证 Compare.CREATE 使用旧的 createRevision（应失败）");
+            System.out.println("21.5 验证 Compare.CREATE 使用旧的 createRevision（应失败）");
             TxnRequest txnOld = TxnRequest.builder()
                     .compares(java.util.List.of(Compare.create(key, CompareOp.EQUAL, createRev1)))
                     .success(java.util.List.of(Operation.put(key, "should-not-update")))
@@ -1887,7 +1772,7 @@ public class EtcdCompatibilityTest {
             System.out.println("    旧的 createRevision=" + createRev1 + " 不满足 ✓");
 
             // 用新的 createRevision 比较应该成功
-            System.out.println("23.6 验证 Compare.CREATE 使用新的 createRevision（应成功）");
+            System.out.println("21.6 验证 Compare.CREATE 使用新的 createRevision（应成功）");
             TxnRequest txnNew = TxnRequest.builder()
                     .compares(java.util.List.of(Compare.create(key, CompareOp.EQUAL, createRev2)))
                     .success(java.util.List.of(Operation.put(key, "create-rev-match")))

@@ -60,7 +60,7 @@ public class TxnController {
     }
 
     /**
-     * 执行事务
+     * 执行事务，其实etcd里面的事务就是一个cas操作
      *
      * 请求体格式：
      * {
