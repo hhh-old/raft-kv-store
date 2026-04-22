@@ -8,6 +8,7 @@ import lombok.extern.slf4j.Slf4j;
 
 import java.util.*;
 import java.util.concurrent.*;
+import java.util.stream.*;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
@@ -42,10 +43,18 @@ public class EtcdCompatibilityTest {
     private final RaftKVClient client;
     private final List<String> testKeys = new ArrayList<>();
     
-    public EtcdCompatibilityTest(String serverUrl) {
-        this.client = new RaftKVClient(serverUrl);
+
+    /**
+     * 构造函数 - 使用多节点地址列表（支持故障转移）
+     */
+    public EtcdCompatibilityTest(List<String> serverUrls) {
+        this.client = RaftKVClient.builder()
+                .serverUrls(serverUrls)
+                .maxRetries(3)
+                .timeoutSeconds(8)
+                .build();
     }
-    
+
     /**
      * 单个测试结果
      */
@@ -68,7 +77,21 @@ public class EtcdCompatibilityTest {
         System.out.println("║         Raft KV Store - etcd 兼容性全面测试                       ║");
         System.out.println("╚════════════════════════════════════════════════════════════════════╝\n");
 
-        EtcdCompatibilityTest test = new EtcdCompatibilityTest("http://localhost:9081");
+        // =====================================================
+        // 配置端点列表（支持故障转移）
+        // =====================================================
+        // 单节点模式（向后兼容）
+        // EtcdCompatibilityTest test = new EtcdCompatibilityTest("http://localhost:9081");
+        
+        // 多节点模式（推荐）- 支持故障转移
+        List<String> serverUrls = Arrays.asList(
+                "http://localhost:9081",
+                "http://localhost:9082",
+                "http://localhost:9083"
+        );
+        EtcdCompatibilityTest test = new EtcdCompatibilityTest(serverUrls);
+        // =====================================================
+        
         List<TestResult> results = new ArrayList<>();
 
         try {

@@ -17,6 +17,7 @@ import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Consumer;
 import java.util.stream.Collectors;
@@ -29,6 +30,8 @@ import java.util.stream.Collectors;
  * 2. 自动重试：超时或失败时自动重试
  * 3. Leader 自动重定向：自动跟随 Leader 切换
  * 4. 指数退避：避免雪崩效应
+ * 5. 故障转移：节点宕机时自动切换到其他健康节点
+ * 6. 端点健康状态管理：自动检测不健康节点并跳过
  * 
  * 使用示例：
  * <pre>
@@ -42,7 +45,7 @@ import java.util.stream.Collectors;
  *     .timeoutSeconds(3)
  *     .build();
  * 
- * // PUT 操作
+ * // PUT 操作（节点宕机时自动切换）
  * KVResponse response = client.put("name", "Alice");
  * 
  * // GET 操作
@@ -55,7 +58,47 @@ import java.util.stream.Collectors;
 @Slf4j
 public class RaftKVClient {
 
+    // ==================== 端点健康状态管理 ====================
+    
+    /**
+     * 端点状态
+     */
+    private static class EndpointState {
+        private final String url;
+        private final AtomicInteger consecutiveFailures = new AtomicInteger(0);
+        private volatile long lastFailureTime = 0;
+        
+        EndpointState(String url) {
+            this.url = url;
+        }
+        
+        String getUrl() { return url; }
+        
+        int getConsecutiveFailures() {
+            return consecutiveFailures.get();
+        }
+        
+        void recordSuccess() {
+            consecutiveFailures.set(0);
+        }
+        
+        void recordFailure() {
+            consecutiveFailures.incrementAndGet();
+            lastFailureTime = System.currentTimeMillis();
+        }
+        
+        boolean isHealthy() {
+            return consecutiveFailures.get() < MAX_CONSECUTIVE_FAILURES;
+        }
+    }
+    
+    /** 端点最大连续失败次数，超过后标记为不健康 */
+    private static final int MAX_CONSECUTIVE_FAILURES = 3;
+    
+    // ==================== 核心字段 ====================
+    
     private final java.util.List<String> serverUrls;
+    private final java.util.Map<String, EndpointState> endpointStates;
     private final int maxRetries;
     private final int timeoutSeconds;
     private final ObjectMapper objectMapper;
@@ -63,6 +106,9 @@ public class RaftKVClient {
     
     // 当前已知的 Leader 地址
     private final AtomicReference<String> currentLeader = new AtomicReference<>();
+    
+    // 当前尝试的端点索引（用于轮询）
+    private final AtomicInteger currentEndpointIndex = new AtomicInteger(0);
     
     // 活跃的 Watch 监听器
     private final CopyOnWriteArrayList<WatchListener> activeWatches = new CopyOnWriteArrayList<>();
@@ -76,9 +122,15 @@ public class RaftKVClient {
                 .connectTimeout(Duration.ofSeconds(timeoutSeconds))
                 .build();
         
+        // 初始化端点状态映射
+        this.endpointStates = new java.util.HashMap<>();
+        for (String url : serverUrls) {
+            endpointStates.put(normalizeUrl(url), new EndpointState(normalizeUrl(url)));
+        }
+        
         // 初始化 Leader 为第一个节点
         if (!serverUrls.isEmpty()) {
-            currentLeader.set(serverUrls.get(0));
+            currentLeader.set(normalizeUrl(serverUrls.get(0)));
         }
     }
 
@@ -95,7 +147,12 @@ public class RaftKVClient {
         this.httpClient = HttpClient.newBuilder()
                 .connectTimeout(Duration.ofSeconds(timeoutSeconds))
                 .build();
-        this.currentLeader.set(serverUrl);
+        
+        // 初始化端点状态映射（单节点模式）
+        this.endpointStates = new java.util.HashMap<>();
+        this.endpointStates.put(normalizeUrl(serverUrl), new EndpointState(normalizeUrl(serverUrl)));
+        
+        this.currentLeader.set(normalizeUrl(serverUrl));
     }
 
     /**
@@ -314,23 +371,40 @@ public class RaftKVClient {
     }
 
     /**
-     * 执行请求（带重试和 Leader 重定向）
+     * 执行请求（带重试、故障转移和 Leader 重定向）
+     * 
+     * 故障转移流程：
+     * 1. 在当前 Leader 上执行请求
+     * 2. 成功 → 标记端点健康，返回结果
+     * 3. 连接失败 → 标记当前端点不健康，切换到其他健康端点重试
+     * 4. NOT_LEADER → 更新 Leader，重定向到新 Leader
+     * 5. 其他错误 → 重试（指数退避）
      */
     private KVResponse executeWithRetry(String operation, RequestExecutor executor) {
         Exception lastException = null;
+        java.util.Set<String> triedEndpoints = new java.util.HashSet<>();
 
         for (int attempt = 1; attempt <= maxRetries; attempt++) {
             try {
-                log.debug("Attempt {} to {} using leader: {}", attempt, operation, currentLeader.get());
+                String currentEndpoint = getCurrentLeader();
+                log.debug("Attempt {} to {} using endpoint: {}", attempt, operation, currentEndpoint);
+                
                 KVResponse response = executor.execute();
                 log.debug("Response: success={}, error={}, leaderUrl={}, isNotLeader={}",
                     response.isSuccess(), response.getError(), response.getLeaderUrl(), response.isNotLeader());
 
+                // 成功：标记端点健康，处理可能的 Leader 重定向
+                markEndpointHealthy(currentEndpoint);
+                
                 // 处理重定向循环：直到不是重定向为止
                 while (response.isNotLeader() && response.getLeaderUrl() != null) {
                     log.info("Redirecting to Leader: {}", response.getLeaderUrl());
-                    updateLeader(response.getLeaderUrl());  // 使用 normalizeUrl 处理
+                    updateLeader(response.getLeaderUrl());
                     log.debug("Updated leader, retrying with: {}", currentLeader.get());
+                    
+                    // 重定向到新 Leader 后，标记新端点为健康
+                    markEndpointHealthy(getCurrentLeader());
+                    
                     response = executor.execute();
                     log.debug("After redirect - Response: success={}, error={}, isNotLeader={}",
                         response.isSuccess(), response.getError(), response.isNotLeader());
@@ -346,7 +420,27 @@ public class RaftKVClient {
 
             } catch (Exception e) {
                 lastException = e;
-                log.warn("{} attempt {} failed: {}", operation, attempt, e.getMessage());
+                String currentEndpoint = getCurrentLeader();
+                
+                log.warn("{} attempt {} failed on {}: {}", operation, attempt, currentEndpoint, e.getMessage());
+
+                // 判断是否为连接失败（需要切换端点）
+                if (isConnectionFailure(e)) {
+                    // 标记当前端点为不健康
+                    markEndpointUnhealthy(currentEndpoint);
+                    triedEndpoints.add(currentEndpoint);
+                    
+                    // 尝试切换到其他可用端点
+                    String availableEndpoint = findAvailableEndpoint(triedEndpoints);
+                    if (availableEndpoint != null) {
+                        log.info("Connection failure, switching to available endpoint: {}", availableEndpoint);
+                        updateLeader(availableEndpoint);
+                        // 连接失败后立即重试，不等待
+                        continue;
+                    } else {
+                        log.warn("No available endpoints found, all endpoints have been tried");
+                    }
+                }
 
                 if (attempt < maxRetries) {
                     // 如果是超时且这是第一次尝试，不等待立即重试
@@ -355,8 +449,8 @@ public class RaftKVClient {
                         log.debug("Timeout on first attempt, retrying immediately without waiting...");
                         continue;
                     }
-                    // 指数退避
-                    long waitTime = (long) Math.pow(2, attempt - 1) * 100;
+                    // 指数退避（带随机抖动）
+                    long waitTime = calculateBackoff(attempt);
                     log.debug("Waiting {}ms before retry...", waitTime);
                     try {
                         Thread.sleep(waitTime);
@@ -369,6 +463,110 @@ public class RaftKVClient {
         }
 
         throw new RuntimeException(operation + " failed after " + maxRetries + " attempts", lastException);
+    }
+
+    /**
+     * 标记端点为健康（成功响应）
+     */
+    private void markEndpointHealthy(String endpoint) {
+        if (endpoint == null) return;
+        String normalizedEndpoint = normalizeUrl(endpoint);
+        EndpointState state = endpointStates.get(normalizedEndpoint);
+        if (state != null) {
+            state.recordSuccess();
+        }
+    }
+
+    /**
+     * 标记端点为不健康（连接失败）
+     */
+    private void markEndpointUnhealthy(String endpoint) {
+        if (endpoint == null) return;
+        String normalizedEndpoint = normalizeUrl(endpoint);
+        EndpointState state = endpointStates.get(normalizedEndpoint);
+        if (state != null) {
+            state.recordFailure();
+            log.info("Endpoint {} marked unhealthy, consecutive failures: {}", 
+                    endpoint, state.getConsecutiveFailures());
+        }
+    }
+
+    /**
+     * 判断是否为连接失败（需要切换端点）
+     */
+    private boolean isConnectionFailure(Exception e) {
+        if (e == null) return false;
+        String message = e.getMessage();
+        return e instanceof java.net.ConnectException
+            || e instanceof java.net.http.HttpTimeoutException
+            || e instanceof java.io.IOException
+            || (message != null && (
+                message.contains("Connection refused") 
+                || message.contains("Connection reset")
+                || message.contains("Connect timed out")
+                || message.contains("Unreachable")
+                || message.contains("Network is unreachable")
+            ));
+    }
+
+    /**
+     * 查找可用的端点（优先选择健康的端点）
+     * 
+     * @param triedEndpoints 已尝试过的端点集合
+     * @return 可用的端点 URL，如果没有可用端点返回 null
+     */
+    private String findAvailableEndpoint(java.util.Set<String> triedEndpoints) {
+        // 如果只有一个端点，直接返回（单节点模式）
+        if (serverUrls.size() == 1) {
+            return null;
+        }
+
+        // 1. 优先选择当前 Leader（如果还没尝试过）
+        String leader = currentLeader.get();
+        if (leader != null && !triedEndpoints.contains(leader)) {
+            EndpointState leaderState = endpointStates.get(leader);
+            if (leaderState == null || leaderState.isHealthy()) {
+                return leader;
+            }
+        }
+
+        // 2. 遍历所有端点，寻找健康的端点
+        for (String url : serverUrls) {
+            String normalizedUrl = normalizeUrl(url);
+            if (!triedEndpoints.contains(normalizedUrl)) {
+                EndpointState state = endpointStates.get(normalizedUrl);
+                if (state != null && state.isHealthy()) {
+                    return normalizedUrl;
+                }
+            }
+        }
+
+        // 3. 如果所有健康端点都尝试过，尝试不健康的端点（作为最后手段）
+        for (String url : serverUrls) {
+            String normalizedUrl = normalizeUrl(url);
+            if (!triedEndpoints.contains(normalizedUrl)) {
+                return normalizedUrl;
+            }
+        }
+
+        return null;  // 所有端点都已尝试
+    }
+
+    /**
+     * 计算指数退避时间（带随机抖动）
+     * 
+     * @param attempt 当前尝试次数
+     * @return 退避时间（毫秒）
+     */
+    private long calculateBackoff(int attempt) {
+        // 基础延迟 100ms，最大延迟 3s
+        long baseDelay = 100;
+        long maxDelay = 3000;
+        long delay = Math.min(baseDelay * (long) Math.pow(2, attempt - 1), maxDelay);
+        
+        // 添加随机抖动（0-25%），避免惊群效应
+        long jitter = (long) (delay * 0.25 * Math.random());
+        return delay + jitter;
     }
 
     /**
@@ -421,13 +619,13 @@ public class RaftKVClient {
     }
 
     /**
-     * 获取当前 Leader 地址
+     * 获取当前 Leader 地址（规范化后的 URL）
      */
     private String getCurrentLeader() {
         String leader = currentLeader.get();
         if (leader == null || leader.isEmpty()) {
             // 如果没有 Leader，使用第一个节点
-            leader = serverUrls.get(0);
+            leader = normalizeUrl(serverUrls.get(0));
             currentLeader.set(leader);
         }
         return leader;
