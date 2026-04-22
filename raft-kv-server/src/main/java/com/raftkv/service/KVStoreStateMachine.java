@@ -143,6 +143,30 @@ public class KVStoreStateMachine extends StateMachineAdapter {
     }
 
     /**
+     * 基于固定 revision 的快照读取（线性一致性读的核心）
+     *
+     * 在 ReadIndex 发起前采样 currentRevision，回调中基于该固定 revision 读取。
+     * 这样事务写入的任何新 revision 都大于采样值，对此读操作完全透明。
+     *
+     * @param key key 名称
+     * @param revision 读取的 revision 上限（包含）
+     * @return 该 revision 时小于等于 revision 的最新值，或 null
+     */
+    public MVCCStore.KeyValue getAtRevision(String key, long revision) {
+        return mvccStore.getAtRevision(key, revision);
+    }
+
+    /**
+     * 基于固定 revision 的快照读取（getAll 线性一致性读的核心）
+     *
+     * @param revision 快照 revision
+     * @return 指定 revision 时的所有 key-value（排除 tombstone）
+     */
+    public Map<String, MVCCStore.KeyValue> getAllAtRevision(long revision) {
+        return mvccStore.getAllAtRevision(revision);
+    }
+
+    /**
      * 获取事务执行结果（用于回调）
      * @param requestId 请求 ID
      * @return 事务响应，如果不存在返回 null
@@ -919,7 +943,7 @@ public class KVStoreStateMachine extends StateMachineAdapter {
                                                   int subRev) {
         // etcd 事务语义：所有操作共享同一个 mainRev，通过 subRev 区分顺序
         MVCCStore.Revision txnRev = new MVCCStore.Revision(mainRev, subRev);
-        
+
         // 使用指定的 revision 写入（不生成新的 revision）
         mvccStore.putWithRevision(key, value, txnRev);
 

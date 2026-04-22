@@ -650,32 +650,36 @@ public class RaftKVService {
         try {
             CompletableFuture<KVResponse> future = new CompletableFuture<>();
             
-            // 将 key 作为 requestContext 传递到回调中
-            // 这样可以在回调中知道要读取哪个 key
-            byte[] requestContext = key.getBytes(StandardCharsets.UTF_8);
+            // 在发起 ReadIndex 前先采样当前 revision（MVCC 快照读的关键）
+            // 原理：
+            //   1. 发起 ReadIndex 前，currentRevision = N（还没有新事务递增）
+            //   2. ReadIndex 回调触发时，事务可能将 revision 递增到 N+1, N+2...
+            //   3. 但回调中使用 getAtRevision(key, N)，只能看到 revision <= N 的数据
+            //   4. 事务逐条写入的 revision N+1 对此读操作完全透明
+            //   5. 读操作只能看到事务完整提交前的状态，避免了中间状态可见
+            long readRevision = stateMachine.getCurrentRevision();
             
-            // 调用 ReadIndex
-            // SOFAJRaft 会：
-            // 1. 记录当前的 committed index（ReadIndex）
-            // 2. 向 Follower 发送心跳，确认 Leader 身份
-            // 3. 等待大多数 Follower 确认
-            // 4. 等待状态机应用到 ReadIndex
-            // 5. 调用回调函数
+            // 将 key:revision 编码到 requestContext 中，传递到回调
+            byte[] requestContext = (key + "\0" + readRevision).getBytes(StandardCharsets.UTF_8);
+            
             node.readIndex(requestContext, new ReadIndexClosure() {
                 @Override
                 public void run(Status status, long index, byte[] reqCtx) {
                     if (status.isOk()) {
-                        // ReadIndex 成功，可以安全读取
-                        // 此时状态机已经应用到 index，保证读到的是最新的 committed 数据
                         try {
-                            String readKey = new String(reqCtx, StandardCharsets.UTF_8);
-                            String value = stateMachine.get(readKey);
-                            LOG.debug("ReadIndex GET successful: key={}, value={}, index={}", 
-                                readKey, value, index);
+                            // 解析 key 和采样的 revision
+                            String ctxStr = new String(reqCtx, StandardCharsets.UTF_8);
+                            int sep = ctxStr.indexOf('\0');
+                            String readKey = ctxStr.substring(0, sep);
+                            long rev = Long.parseLong(ctxStr.substring(sep + 1));
                             
-                            // 区分 key 存在但值为空字符串 vs key 不存在（对齐 etcd）
-                            // etcd: key 不存在时返回空 kvs + count=0
-                            // 这里用 found 字段区分：found=false 表示 key 不存在
+                            // 基于固定 revision 做快照读（而非 getLatest）
+                            MVCCStore.KeyValue kv = stateMachine.getAtRevision(readKey, rev);
+                            String value = (kv != null) ? kv.getValue() : null;
+                            
+                            LOG.debug("ReadIndex GET successful: key={}, readRevision={}, value={}, index={}",
+                                readKey, rev, value, index);
+                            
                             if (value != null) {
                                 future.complete(KVResponse.success(
                                     readKey, value, requestId, getCurrentEndpoint()));
@@ -688,7 +692,6 @@ public class RaftKVService {
                             future.complete(KVResponse.failure(e.getMessage(), requestId));
                         }
                     } else {
-                        // ReadIndex 失败（可能 Leader 切换、网络分区等）
                         LOG.warn("ReadIndex failed: {}", status.getErrorMsg());
                         future.complete(KVResponse.failure(
                             "Read failed: " + status.getErrorMsg(), requestId));
@@ -736,25 +739,38 @@ public class RaftKVService {
         try {
             CompletableFuture<Map<String, String>> future = new CompletableFuture<>();
             
-            // 使用特殊标记表示这是 getAll 操作
-            byte[] requestContext = "__GET_ALL__".getBytes(StandardCharsets.UTF_8);
+            // 在发起 ReadIndex 前先采样当前 revision（与 get() 相同的快照读原理）
+            long readRevision = stateMachine.getCurrentRevision();
+            
+            // 将 revision 编码到 requestContext 中，传递到回调
+            byte[] requestContext = ("__GET_ALL__\0" + readRevision).getBytes(StandardCharsets.UTF_8);
             
             node.readIndex(requestContext, new ReadIndexClosure() {
                 @Override
                 public void run(Status status, long index, byte[] reqCtx) {
                     if (status.isOk()) {
-                        // ReadIndex 成功，状态机已应用到 index，可以安全读取
                         try {
-                            Map<String, String> allData = stateMachine.getAll();
-                            LOG.debug("ReadIndex GET_ALL successful: {} keys, index={}", 
-                                allData.size(), index);
+                            // 解析采样的 revision
+                            String ctxStr = new String(reqCtx, StandardCharsets.UTF_8);
+                            int sep = ctxStr.indexOf('\0');
+                            long rev = Long.parseLong(ctxStr.substring(sep + 1));
+                            
+                            // 基于固定 revision 做快照读（保证 getAll 的原子快照一致性）
+                            Map<String, MVCCStore.KeyValue> allKv = stateMachine.getAllAtRevision(rev);
+                            Map<String, String> allData = new java.util.HashMap<>();
+                            for (Map.Entry<String, MVCCStore.KeyValue> entry : allKv.entrySet()) {
+                                if (entry.getValue().getValue() != null) {
+                                    allData.put(entry.getKey(), entry.getValue().getValue());
+                                }
+                            }
+                            LOG.debug("ReadIndex GET_ALL successful: {} keys, readRevision={}, index={}",
+                                allData.size(), rev, index);
                             future.complete(allData);
                         } catch (Exception e) {
                             LOG.error("ReadIndex GET_ALL callback error", e);
                             future.complete(null);
                         }
                     } else {
-                        // ReadIndex 失败（Leader 可能已经变更）
                         LOG.warn("ReadIndex GET_ALL failed: {}", status.getErrorMsg());
                         future.complete(null);
                     }
