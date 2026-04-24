@@ -119,6 +119,8 @@ public class EtcdCompatibilityTest {
             results.add(test.runTestCase("21", "删除后 recreate", test::testDeleteRecreateCreateRevision));
             results.add(test.runTestCase("22", "Tombstone version=0", test::testTombstoneVersionZero));
             results.add(test.runTestCase("23", "事务内 revision 共享", test::testTransactionRevisionSharingDetailed));
+            results.add(test.runTestCase("24", "Watch 并发写不丢事件", test::testWatchConcurrentWrites));
+            results.add(test.runTestCase("25", "Watch 断线重连", test::testWatchReconnect));
 
         } finally {
             test.cleanup();
@@ -689,7 +691,7 @@ public class EtcdCompatibilityTest {
             CountDownLatch latch = new CountDownLatch(3);
             List<WatchEvent> events = new CopyOnWriteArrayList<>();
             
-            WatchListener listener = client.watch(watchedKey, event -> {
+            WatchListener listener = client.watchFromRevision(watchedKey, startRevision, event -> {
                 events.add(event);
                 System.out.println("    [事件] type=" + event.getType() + ", key=" + event.getKey() + ", rev=" + event.getRevision());
                 latch.countDown();
@@ -715,7 +717,7 @@ public class EtcdCompatibilityTest {
             boolean eventsReceived = latch.await(3, TimeUnit.SECONDS);
             
             // 清理
-            client.cancelWatch(listener.getWatchId());
+            client.cancelWatch(listener);
             
             // 验证
             System.out.println("8.6 验证结果");
@@ -758,11 +760,11 @@ public class EtcdCompatibilityTest {
             long startRevision = client.getCurrentRevision() + 1;
             System.out.println("9.1 从 revision " + startRevision + " 开始监听前缀: " + prefix);
             
-            // 创建前缀 Watch
+            // 创建前缀 Watch（使用 watchFromRevision 明确指定起始版本）
             CountDownLatch latch = new CountDownLatch(3);
             List<WatchEvent> events = new CopyOnWriteArrayList<>();
             
-            WatchListener listener = client.watchPrefix(prefix, event -> {
+            WatchListener listener = client.watchPrefixFromRevision(prefix, startRevision, event -> {
                 events.add(event);
                 System.out.println("    [事件] type=" + event.getType() + ", key=" + event.getKey());
                 latch.countDown();
@@ -791,7 +793,7 @@ public class EtcdCompatibilityTest {
             latch.await(3, TimeUnit.SECONDS);
             
             // 清理
-            client.cancelWatch(listener.getWatchId());
+            client.cancelWatch(listener);
             
             // 验证
             System.out.println("9.7 验证结果");
@@ -860,7 +862,7 @@ public class EtcdCompatibilityTest {
             latch.await(3, TimeUnit.SECONDS);
             
             // 清理
-            client.cancelWatch(listener.getWatchId());
+            client.cancelWatch(listener);
             
             // 验证
             System.out.println("10.4 验证结果");
@@ -1155,7 +1157,7 @@ public class EtcdCompatibilityTest {
             Thread.sleep(200);
 
             latch.await(3, TimeUnit.SECONDS);
-            client.cancelWatch(listener.getWatchId());
+            client.cancelWatch(listener);
 
             // 验证
             System.out.println("16.4 验证事件类型");
@@ -1837,6 +1839,197 @@ public class EtcdCompatibilityTest {
     private void assertEquals(Object expected, Object actual, String message) {
         if (!Objects.equals(expected, actual)) {
             throw new AssertionError(message + " (期望: " + expected + ", 实际: " + actual + ")");
+        }
+    }
+    
+    // ==================== 24. Watch 并发写测试 ====================
+    
+    /**
+     * 测试 Watch 与并发写事件不丢推送：
+     * - 同时启动 Watch 和大量并发写操作
+     * - 验证所有写事件都被正确推送（不漏事件）
+     * - 验证事件顺序正确
+     */
+    private boolean testWatchConcurrentWrites() {
+        printSection("测试 24: Watch 并发写不丢事件");
+        
+        String key = "/test/watch/concurrent-" + System.currentTimeMillis();
+        testKeys.add(key);
+        
+        try {
+            // 初始化
+            client.put(key, "initial");
+            Thread.sleep(100);
+            
+            long startRevision = client.getCurrentRevision() + 1;
+            System.out.println("24.1 从 revision " + startRevision + " 开始监听");
+            
+            // 创建 Watch
+            CountDownLatch latch = new CountDownLatch(10);
+            List<WatchEvent> events = new CopyOnWriteArrayList<>();
+            List<Long> receivedRevisions = new CopyOnWriteArrayList<>();
+            
+            WatchListener listener = client.watchFromRevision(key, startRevision, event -> {
+                events.add(event);
+                receivedRevisions.add(event.getRevision());
+                System.out.println("    [事件] rev=" + event.getRevision() + ", value=" + event.getValue());
+                latch.countDown();
+            });
+            System.out.println("24.2 Watch 已创建: " + listener.getWatchId());
+            
+            // 并发写入 10 个版本
+            System.out.println("24.3 启动并发写入...");
+            int writeCount = 10;
+            ExecutorService executor = Executors.newFixedThreadPool(4);
+            CountDownLatch writeLatch = new CountDownLatch(writeCount);
+            
+            for (int i = 1; i <= writeCount; i++) {
+                final int version = i;
+                executor.submit(() -> {
+                    try {
+                        client.put(key, "v" + version);
+                        System.out.println("    [写入] v" + version);
+                    } catch (Exception e) {
+                        System.out.println("    [写入失败] v" + version + ": " + e.getMessage());
+                    } finally {
+                        writeLatch.countDown();
+                    }
+                });
+            }
+            
+            // 等待所有写入完成
+            writeLatch.await(5, TimeUnit.SECONDS);
+            executor.shutdown();
+            
+            // 等待事件接收
+            boolean eventsReceived = latch.await(5, TimeUnit.SECONDS);
+            
+            // 清理
+            client.cancelWatch(listener);
+            
+            // 验证
+            System.out.println("24.4 验证结果");
+            System.out.println("    预期事件数: " + writeCount);
+            System.out.println("    实际收到事件数: " + events.size());
+            System.out.println("    事件顺序: " + receivedRevisions);
+            
+            // 检查是否所有事件都被收到
+            boolean allEventsReceived = events.size() == writeCount;
+            
+            // 检查 revision 连续性（如果有丢事件，revision 会不连续）
+            boolean revisionsContinuous = true;
+            if (receivedRevisions.size() > 1) {
+                List<Long> sorted = new ArrayList<>(receivedRevisions);
+                Collections.sort(sorted);
+                for (int i = 1; i < sorted.size(); i++) {
+                    if (sorted.get(i) - sorted.get(i - 1) > 1) {
+                        revisionsContinuous = false;
+                        System.out.println("    revision 不连续: " + sorted.get(i - 1) + " -> " + sorted.get(i));
+                        break;
+                    }
+                }
+            }
+            
+            System.out.println("    所有事件收到: " + allEventsReceived);
+            System.out.println("    revision 连续: " + revisionsContinuous);
+            
+            return allEventsReceived && revisionsContinuous;
+        } catch (Exception e) {
+            System.out.println("    测试失败: " + e.getMessage());
+            e.printStackTrace();
+            return false;
+        }
+    }
+    
+    // ==================== 25. Watch 断线重连测试 ====================
+    
+    /**
+     * 测试 Watch 断线重连：
+     * - 监听一个 key
+     * - 模拟断线（关闭现有连接）
+     * - 验证能从断点继续接收事件
+     */
+    private boolean testWatchReconnect() {
+        printSection("测试 25: Watch 断线重连");
+        
+        String key = "/test/watch/reconnect-" + System.currentTimeMillis();
+        testKeys.add(key);
+        
+        try {
+            // 初始化
+            client.put(key, "v0");
+            Thread.sleep(100);
+            
+            long startRevision = client.getCurrentRevision() + 1;
+            System.out.println("25.1 从 revision " + startRevision + " 开始监听");
+            
+            // 创建 Watch
+            CountDownLatch latch = new CountDownLatch(3);
+            List<WatchEvent> events = new CopyOnWriteArrayList<>();
+            
+            WatchListener listener = client.watchFromRevision(key, startRevision, event -> {
+                events.add(event);
+                System.out.println("    [事件] rev=" + event.getRevision() + ", value=" + event.getValue());
+                latch.countDown();
+            });
+            System.out.println("25.2 Watch 已创建: " + listener.getWatchId());
+            
+            // 写入第一个事件
+            System.out.println("25.3 写入 v1");
+            client.put(key, "v1");
+            Thread.sleep(200);
+            
+            // 获取当前 revision（用于验证重连后从正确的位置继续）
+            long revisionBeforeReconnect = client.getCurrentRevision();
+            System.out.println("    断线前 revision: " + revisionBeforeReconnect);
+            
+            // 模拟断线：取消当前的 watch（但不关闭客户端）
+            System.out.println("25.4 模拟断线，取消 watch");
+            client.cancelWatch(listener);
+            Thread.sleep(500);
+            
+            // 再写入一个事件（应该在重连后收到）
+            System.out.println("25.5 断线期间写入 v2");
+            client.put(key, "v2");
+            Thread.sleep(100);
+            
+            // 重连：从断点继续监听
+            System.out.println("25.6 重连，从 revision " + (revisionBeforeReconnect + 1) + " 继续监听");
+            List<WatchEvent> reconnectEvents = new CopyOnWriteArrayList<>();
+            CountDownLatch reconnectLatch = new CountDownLatch(2);
+            
+            WatchListener reconnectListener = client.watchFromRevision(key, revisionBeforeReconnect + 1, event -> {
+                reconnectEvents.add(event);
+                System.out.println("    [重连事件] rev=" + event.getRevision() + ", value=" + event.getValue());
+                reconnectLatch.countDown();
+            });
+            System.out.println("    重连 Watch 已创建: " + reconnectListener.getWatchId());
+            
+            // 写入另一个事件
+            System.out.println("25.7 写入 v3");
+            client.put(key, "v3");
+            
+            // 等待事件
+            boolean eventsReceived = reconnectLatch.await(3, TimeUnit.SECONDS);
+            client.cancelWatch(reconnectListener);
+            
+            // 验证
+            System.out.println("25.8 验证结果");
+            System.out.println("    重连后收到事件数: " + reconnectEvents.size());
+            System.out.println("    预期: >= 2（v2 和 v3）");
+            
+            // 检查是否包含断线期间的事件 v2
+            boolean hasV2 = reconnectEvents.stream().anyMatch(e -> "v2".equals(e.getValue()));
+            boolean hasV3 = reconnectEvents.stream().anyMatch(e -> "v3".equals(e.getValue()));
+            
+            System.out.println("    包含 v2（断线期间）: " + hasV2);
+            System.out.println("    包含 v3（重连后）: " + hasV3);
+            
+            return reconnectEvents.size() >= 2 && hasV2 && hasV3;
+        } catch (Exception e) {
+            System.out.println("    测试失败: " + e.getMessage());
+            e.printStackTrace();
+            return false;
         }
     }
     

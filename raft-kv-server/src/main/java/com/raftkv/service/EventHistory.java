@@ -135,6 +135,7 @@ public class EventHistory {
      * @return 从该版本开始的事件列表（已复制，线程安全），如果版本已过期返回空列表
      */
     public List<WatchEvent> getEventsFrom(long startRevision) {
+        //如果startRevision <= 0，表示客户端没指定startRevision，表示只接收最新的消息不接收历史消息
         if (startRevision <= 0) {
             return Collections.emptyList();
         }

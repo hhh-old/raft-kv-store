@@ -116,7 +116,7 @@ public class WatchExample {
         System.out.println("等待事件...（按回车取消监听）\n");
         
         new Scanner(System.in).nextLine();
-        client.cancelWatch(listener.getWatchId());
+        client.cancelWatch(listener);
         System.out.println("已取消监听");
     }
 
@@ -148,7 +148,7 @@ public class WatchExample {
         System.out.println("等待事件...（按回车取消监听）\n");
         
         new Scanner(System.in).nextLine();
-        client.cancelWatch(listener.getWatchId());
+        client.cancelWatch(listener);
         System.out.println("已取消监听");
     }
 
@@ -192,7 +192,7 @@ public class WatchExample {
         System.out.println("等待事件...（按回车取消监听）\n");
         
         new Scanner(System.in).nextLine();
-        client.cancelWatch(listener.getWatchId());
+        client.cancelWatch(listener);
         System.out.println("已取消监听");
         
         // 清理
@@ -237,9 +237,9 @@ public class WatchExample {
         System.out.println("等待事件...（按回车取消所有监听）\n");
         new Scanner(System.in).nextLine();
         
-        client.cancelWatch(watch1.getWatchId());
-        client.cancelWatch(watch2.getWatchId());
-        client.cancelWatch(watch3.getWatchId());
+        client.cancelWatch(watch1);
+        client.cancelWatch(watch2);
+        client.cancelWatch(watch3);
         System.out.println("已取消所有监听");
     }
 }

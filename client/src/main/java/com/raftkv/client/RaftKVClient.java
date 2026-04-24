@@ -702,6 +702,18 @@ public class RaftKVClient {
     public WatchListener watchPrefix(String prefix, Consumer<WatchEvent> callback) {
         return watch(prefix, true, 0, callback);
     }
+    
+    /**
+     * 从指定版本开始监听前缀的所有 Key 变化
+     * 
+     * @param prefix Key 前缀
+     * @param startRevision 起始版本号
+     * @param callback 事件回调函数
+     * @return WatchListener 用于取消监听
+     */
+    public WatchListener watchPrefixFromRevision(String prefix, long startRevision, Consumer<WatchEvent> callback) {
+        return watch(prefix, true, startRevision, callback);
+    }
 
     /**
      * 从历史版本开始监听
@@ -717,6 +729,7 @@ public class RaftKVClient {
 
     /**
      * 创建 Watch 订阅（通用方法，etcd 风格一步式）
+     * 非阻塞调用操作
      *
      * 客户端直接发送 POST /watch/stream，服务端立即返回 SSE 事件流，
      * 无需预先调用 POST /watch 获取 watchId。
@@ -728,71 +741,95 @@ public class RaftKVClient {
      * @return WatchListener
      */
     private WatchListener watch(String key, boolean isPrefix, long startRevision, Consumer<WatchEvent> callback) {
-        log.info("Creating direct watch stream: key={}, prefix={}, startRevision={}", key, isPrefix, startRevision);
+        log.info("Creating watch: key={}, prefix={}, startRevision={}", key, isPrefix, startRevision);
 
-        try {
-            // 客户端生成 watchId，用于后续取消和服务端识别
-            String watchId = UUID.randomUUID().toString();
 
-            // 构造一步式请求体
-            Map<String, Object> requestBody = new HashMap<>();
-            requestBody.put("key", key);
-            requestBody.put("prefix", isPrefix);
-            requestBody.put("startRevision", startRevision);
-            requestBody.put("watchId", watchId);
+        WatchListener listener = new WatchListener(null, key, isPrefix, startRevision, callback);
+        activeWatches.add(listener);
 
-            WatchListener listener = new WatchListener(watchId, key, isPrefix, callback);
-            activeWatches.add(listener);
+        // 启动重连循环（异步）
+        CompletableFuture.runAsync(() -> runWatchLoop(listener))
+                .exceptionally(ex -> {
+                    log.error("Watch loop ended unexpectedly: key={}", key, ex);
+                    activeWatches.remove(listener);
+                    return null;
+                });
 
-            // 异步启动一步式 SSE 流监听
-            CompletableFuture.runAsync(() -> startDirectWatchStream(listener, requestBody))
-                    .exceptionally(ex -> {
-                        log.error("Direct watch stream task failed: {}", watchId, ex);
-                        listener.onError(ex instanceof Exception ? (Exception) ex : new RuntimeException(ex));
-                        activeWatches.remove(listener);
-                        return null;
-                    });
-
-            return listener;
-
-        } catch (Exception e) {
-            log.error("Failed to create direct watch stream", e);
-            throw new RuntimeException("Failed to create direct watch stream", e);
-        }
+        return listener;
     }
 
     /**
-     * 启动一步式 Watch 事件流监听（etcd 风格）
+     * Watch 重连循环：连接断开后指数退避重试
+     *
+     * etcd 风格：记录 lastReceivedRevision，断线后用 startRevision = last + 1 重新连接，
+     * 服务端通过 Double-Check 回放断线期间的历史事件。
      */
-    private void startDirectWatchStream(WatchListener listener, Map<String, Object> requestBody) {
-        try {
-            String url = getCurrentLeader() + "/watch/stream";
-            HttpRequest request = HttpRequest.newBuilder()
-                    .uri(URI.create(url))
-                    .header("Content-Type", "application/json")
-                    .header("Accept", "text/event-stream")
-                    .POST(HttpRequest.BodyPublishers.ofString(objectMapper.writeValueAsString(requestBody)))
-                    .build();
-
-            HttpResponse<java.io.InputStream> response = httpClient.send(request,
-                    HttpResponse.BodyHandlers.ofInputStream());
-
-            if (response.statusCode() != 200) {
-                log.error("Direct watch stream failed: HTTP {}", response.statusCode());
-                listener.onError(new RuntimeException("HTTP " + response.statusCode()));
-                return;
+    private void runWatchLoop(WatchListener listener) {
+        while (!listener.isCancelled()) {
+            try {
+                startDirectWatchStream(listener);
+                // 正常结束（服务端关闭连接且未抛异常）
+                log.info("Watch stream ended normally: key={}", listener.getKey());
+            } catch (Exception e) {
+                if (listener.isCancelled()) {
+                    break;
+                }
+                log.warn("Watch connection lost: key={}, error={}", listener.getKey(), e.getMessage());
             }
 
-            readSseStream(listener, response.body());
-            log.info("Direct watch stream ended: {}", listener.getWatchId());
-            listener.onComplete();
+            if (listener.isCancelled()) {
+                break;
+            }
 
-        } catch (Exception e) {
-            log.error("Direct watch stream error: {}", listener.getWatchId(), e);
-            listener.onError(e);
-        } finally {
-            activeWatches.remove(listener);
+            // 指数退避等待
+            listener.incrementReconnectAttempt();
+            long delay = listener.getReconnectDelayMs();
+            log.info("Watch reconnecting in {}ms: key={}, attempt={}",
+                    delay, listener.getKey(), listener.getReconnectAttempt());
+
+            try {
+                Thread.sleep(delay);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                break;
+            }
         }
+
+        log.info("Watch loop ended: key={}", listener.getKey());
+        activeWatches.remove(listener);
+    }
+
+    /**
+     * 启动一步式 Watch 事件流监听（单次连接）
+     */
+    private void startDirectWatchStream(WatchListener listener) throws Exception {
+        // 每次连接生成新的 watchId，旧连接由服务端在检测到断开后自动清理
+        String newWatchId = UUID.randomUUID().toString();
+        listener.updateWatchId(newWatchId);
+        listener.resetReconnectState();
+
+        Map<String, Object> requestBody = new HashMap<>();
+        requestBody.put("key", listener.getKey());
+        requestBody.put("prefix", listener.isPrefix());
+        requestBody.put("startRevision", listener.getNextStartRevision());
+        requestBody.put("watchId", newWatchId);
+
+        String url = getCurrentLeader() + "/watch/stream";
+        HttpRequest request = HttpRequest.newBuilder()
+                .uri(URI.create(url))
+                .header("Content-Type", "application/json")
+                .header("Accept", "text/event-stream")
+                .POST(HttpRequest.BodyPublishers.ofString(objectMapper.writeValueAsString(requestBody)))
+                .build();
+
+        HttpResponse<java.io.InputStream> response = httpClient.send(request,
+                HttpResponse.BodyHandlers.ofInputStream());
+
+        if (response.statusCode() != 200) {
+            throw new RuntimeException("HTTP " + response.statusCode());
+        }
+
+        readSseStream(listener, response.body());
     }
 
     /**
@@ -831,17 +868,23 @@ public class RaftKVClient {
     private void processWatchEvent(WatchListener listener, String eventType, String data) {
         try {
             if ("init".equals(eventType)) {
-                // 初始化事件
                 log.debug("Watch init event: {}", data);
                 return;
             }
+            if ("heartbeat".equals(eventType)) {
+                log.debug("Watch heartbeat: {}", data);
+                return;
+            }
 
-            // 解析事件数据
             WatchEvent event = objectMapper.readValue(data, WatchEvent.class);
             log.debug("Received watch event: type={}, key={}, revision={}",
                     event.getType(), event.getKey(), event.getRevision());
 
-            // 调用回调
+            // 更新最后收到的 revision（用于断线后精确重连）
+            listener.updateLastRevision(event.getRevision());
+            // 收到有效事件后重置退避（连接健康）
+            listener.resetReconnectState();
+
             listener.getCallback().accept(event);
 
         } catch (Exception e) {
@@ -850,33 +893,28 @@ public class RaftKVClient {
     }
 
     /**
-     * 取消 Watch 监听
-     * 
-     * @param watchId Watch ID
+     * 取消 Watch 监听。
+     * 标记 listener 为已取消，runWatchLoop 检测后退出，并通知服务端关闭当前连接。
      */
-    public void cancelWatch(String watchId) {
-        if (watchId == null) {
-            log.warn("cancelWatch called with null watchId");
+    public void cancelWatch(WatchListener listener) {
+        if (listener == null) {
             return;
         }
-        activeWatches.stream()
-                .filter(w -> watchId.equals(w.getWatchId()))
-                .findFirst()
-                .ifPresent(WatchListener::cancel);
-
-        try {
-            String url = getCurrentLeader() + "/watch/" + watchId;
-            HttpRequest request = HttpRequest.newBuilder()
-                    .uri(URI.create(url))
-                    .timeout(Duration.ofSeconds(timeoutSeconds))
-                    .DELETE()
-                    .build();
-
-            httpClient.send(request, HttpResponse.BodyHandlers.discarding());
-            log.info("Watch cancelled: {}", watchId);
-
-        } catch (Exception e) {
-            log.warn("Failed to cancel watch on server: {}", watchId, e);
+        listener.cancel();
+        String currentWatchId = listener.getWatchId();
+        if (currentWatchId != null) {
+            try {
+                String url = getCurrentLeader() + "/watch/" + currentWatchId;
+                HttpRequest request = HttpRequest.newBuilder()
+                        .uri(URI.create(url))
+                        .timeout(Duration.ofSeconds(timeoutSeconds))
+                        .DELETE()
+                        .build();
+                httpClient.send(request, HttpResponse.BodyHandlers.discarding());
+                log.info("Watch cancelled: key={}, watchId={}", listener.getKey(), currentWatchId);
+            } catch (Exception e) {
+                log.warn("Failed to cancel watch on server: watchId={}", currentWatchId, e);
+            }
         }
     }
 
@@ -913,8 +951,8 @@ public class RaftKVClient {
         for (WatchListener listener : activeWatches) {
             listener.cancel();
         }
-        activeWatches.clear();
-        log.info("All watches closed");
+        // 不立即 clear，由各个 runWatchLoop 检测到 cancelled 后自行移除
+        log.info("All watches marked for closing");
     }
 
     // ==================== 事务支持 ====================
@@ -1065,22 +1103,32 @@ public class RaftKVClient {
     }
 
     /**
-     * Watch 监听器类
+     * Watch 监听器类（支持断线重连）
      */
     public static class WatchListener {
-        private final String watchId;
+        private volatile String watchId;
         private final String key;
         private final boolean isPrefix;
+        private final long initialStartRevision;
         private final Consumer<WatchEvent> callback;
         private volatile boolean cancelled = false;
-        private volatile boolean completed = false;
-        private Exception error = null;
 
-        public WatchListener(String watchId, String key, boolean isPrefix, Consumer<WatchEvent> callback) {
+        // 断线重连状态，客户端记录收到的事件的Revision，用于断线重连标记
+        private volatile long lastReceivedRevision = 0;
+        private volatile int reconnectAttempt = 0;
+        private volatile long reconnectDelayMs = 1000;
+
+        public WatchListener(String watchId, String key, boolean isPrefix,
+                             long initialStartRevision, Consumer<WatchEvent> callback) {
             this.watchId = watchId;
             this.key = key;
             this.isPrefix = isPrefix;
+            this.initialStartRevision = initialStartRevision;
             this.callback = callback;
+        }
+
+        public synchronized void updateWatchId(String watchId) {
+            this.watchId = watchId;
         }
 
         public String getWatchId() {
@@ -1107,20 +1155,32 @@ public class RaftKVClient {
             return cancelled;
         }
 
-        public void onComplete() {
-            this.completed = true;
+        public void updateLastRevision(long revision) {
+            if (revision > this.lastReceivedRevision) {
+                this.lastReceivedRevision = revision;
+            }
         }
 
-        public void onError(Exception e) {
-            this.error = e;
+        public long getNextStartRevision() {
+            return lastReceivedRevision > 0 ? lastReceivedRevision + 1 : initialStartRevision;
         }
 
-        public boolean isCompleted() {
-            return completed;
+        public void resetReconnectState() {
+            this.reconnectAttempt = 0;
+            this.reconnectDelayMs = 1000;
         }
 
-        public Exception getError() {
-            return error;
+        public void incrementReconnectAttempt() {
+            this.reconnectAttempt++;
+            this.reconnectDelayMs = Math.min(this.reconnectDelayMs * 2, 30000);
+        }
+
+        public long getReconnectDelayMs() {
+            return reconnectDelayMs;
+        }
+
+        public int getReconnectAttempt() {
+            return reconnectAttempt;
         }
     }
 }
