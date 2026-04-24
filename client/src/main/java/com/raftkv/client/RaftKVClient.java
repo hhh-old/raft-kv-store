@@ -107,9 +107,6 @@ public class RaftKVClient {
     // 当前已知的 Leader 地址
     private final AtomicReference<String> currentLeader = new AtomicReference<>();
     
-    // 当前尝试的端点索引（用于轮询）
-    private final AtomicInteger currentEndpointIndex = new AtomicInteger(0);
-    
     // 活跃的 Watch 监听器
     private final CopyOnWriteArrayList<WatchListener> activeWatches = new CopyOnWriteArrayList<>();
 
@@ -274,32 +271,54 @@ public class RaftKVClient {
      * @return 所有键值对的 Map
      */
     public Map<String, String> getAll() {
-        log.debug("GET_ALL request");
-
         Exception lastException = null;
 
         for (int attempt = 1; attempt <= maxRetries; attempt++) {
             try {
-                log.debug("Attempt {} to GET_ALL using leader: {}", attempt, currentLeader.get());
                 String url = getCurrentLeader() + "/kv/all";
-                Map<String, String> result = executeGetAllRequest(url);
-                log.debug("GET_ALL successful");
-                return result;
+                HttpRequest request = HttpRequest.newBuilder()
+                        .uri(URI.create(url))
+                        .timeout(Duration.ofSeconds(timeoutSeconds))
+                        .header("Accept", "application/json")
+                        .GET()
+                        .build();
 
+                HttpResponse<String> response = httpClient.send(request, HttpResponse.BodyHandlers.ofString());
+
+                if (response.statusCode() == 200) {
+                    String body = response.body();
+                    if (body == null || body.isEmpty() || body.equals("{}")) {
+                        return new HashMap<>();
+                    }
+                    markEndpointHealthy(getCurrentLeader());
+                    return objectMapper.readValue(body, Map.class);
+                } else if (response.statusCode() == 301) {
+                    String location = response.headers().firstValue("Location").orElse(null);
+                    if (location != null) {
+                        updateLeader(location.replace("/kv/all", ""));
+                    }
+                    continue;
+                } else {
+                    throw new RuntimeException("HTTP " + response.statusCode() + ": " + response.body());
+                }
             } catch (Exception e) {
                 lastException = e;
                 log.warn("GET_ALL attempt {} failed: {}", attempt, e.getMessage());
 
-                // 处理重定向
-                if (e.getMessage() != null && e.getMessage().contains("NOT_LEADER")) {
-                    log.info("Retrying with new leader...");
-                    continue;  // 立即重试，不等待
+                if (isConnectionFailure(e)) {
+                    markEndpointUnhealthy(getCurrentLeader());
+                    String available = findAvailableEndpoint(new java.util.HashSet<>());
+                    if (available != null) {
+                        updateLeader(available);
+                        continue;
+                    }
                 }
 
                 if (attempt < maxRetries) {
-                    // 指数退避
-                    long waitTime = (long) Math.pow(2, attempt - 1) * 100;
-                    log.debug("Waiting {}ms before retry...", waitTime);
+                    if (attempt == 1 && e instanceof java.net.http.HttpTimeoutException) {
+                        continue;
+                    }
+                    long waitTime = calculateBackoff(attempt);
                     try {
                         Thread.sleep(waitTime);
                     } catch (InterruptedException ie) {
@@ -311,42 +330,6 @@ public class RaftKVClient {
         }
 
         throw new RuntimeException("GET_ALL failed after " + maxRetries + " attempts", lastException);
-    }
-
-    /**
-     * 执行 GET ALL 请求
-     */
-    @SuppressWarnings("unchecked")
-    private Map<String, String> executeGetAllRequest(String url) throws Exception {
-        log.debug("Sending GET_ALL request to: {}", url);
-        HttpRequest request = HttpRequest.newBuilder()
-                .uri(URI.create(url))
-                .timeout(Duration.ofSeconds(timeoutSeconds))
-                .header("Accept", "application/json")
-                .GET()
-                .build();
-
-        HttpResponse<String> response = httpClient.send(request, 
-                HttpResponse.BodyHandlers.ofString());
-
-        if (response.statusCode() == 200) {
-            // 解析 JSON 响应为 Map
-            String body = response.body();
-            if (body == null || body.isEmpty() || body.equals("{}")) {
-                return new HashMap<>();
-            }
-            // 使用 ObjectMapper 解析 JSON
-            return objectMapper.readValue(body, Map.class);
-        } else if (response.statusCode() == 301) {
-            // 处理重定向
-            String location = response.headers().firstValue("Location")
-                    .orElseThrow(() -> new RuntimeException("Redirect without Location header"));
-            log.info("GET_ALL redirected to: {}", location);
-            currentLeader.set(location.replace("/kv/all", ""));
-            throw new RuntimeException("NOT_LEADER");
-        } else {
-            throw new RuntimeException("HTTP " + response.statusCode() + ": " + response.body());
-        }
     }
 
     /**
@@ -733,8 +716,11 @@ public class RaftKVClient {
     }
 
     /**
-     * 创建 Watch 订阅（通用方法）
-     * 
+     * 创建 Watch 订阅（通用方法，etcd 风格一步式）
+     *
+     * 客户端直接发送 POST /watch/stream，服务端立即返回 SSE 事件流，
+     * 无需预先调用 POST /watch 获取 watchId。
+     *
      * @param key Key 或前缀
      * @param isPrefix 是否为前缀匹配
      * @param startRevision 起始版本号（0 表示从当前开始）
@@ -742,43 +728,26 @@ public class RaftKVClient {
      * @return WatchListener
      */
     private WatchListener watch(String key, boolean isPrefix, long startRevision, Consumer<WatchEvent> callback) {
-        log.info("Creating watch: key={}, prefix={}, startRevision={}", key, isPrefix, startRevision);
+        log.info("Creating direct watch stream: key={}, prefix={}, startRevision={}", key, isPrefix, startRevision);
 
         try {
-            // 1. 创建 Watch 订阅
+            // 客户端生成 watchId，用于后续取消和服务端识别
+            String watchId = UUID.randomUUID().toString();
+
+            // 构造一步式请求体
             Map<String, Object> requestBody = new HashMap<>();
             requestBody.put("key", key);
             requestBody.put("prefix", isPrefix);
             requestBody.put("startRevision", startRevision);
+            requestBody.put("watchId", watchId);
 
-            String url = getCurrentLeader() + "/watch";
-            HttpRequest request = HttpRequest.newBuilder()
-                    .uri(URI.create(url))
-                    .timeout(Duration.ofSeconds(timeoutSeconds))
-                    .header("Content-Type", "application/json")
-                    .POST(HttpRequest.BodyPublishers.ofString(objectMapper.writeValueAsString(requestBody)))
-                    .build();
-
-            HttpResponse<String> response = httpClient.send(request, HttpResponse.BodyHandlers.ofString());
-
-            if (response.statusCode() != 200) {
-                throw new RuntimeException("Failed to create watch: " + response.body());
-            }
-
-            Map<String, Object> result = objectMapper.readValue(response.body(), Map.class);
-            String watchId = (String) result.get("watchId");
-            long currentRevision = ((Number) result.get("currentRevision")).longValue();
-
-            log.info("Watch created: id={}, currentRevision={}", watchId, currentRevision);
-
-            // 2. 启动 SSE 监听线程
             WatchListener listener = new WatchListener(watchId, key, isPrefix, callback);
             activeWatches.add(listener);
-            
-            // 异步启动事件流监听，并处理异常
-            CompletableFuture.runAsync(() -> startWatchStream(listener))
+
+            // 异步启动一步式 SSE 流监听
+            CompletableFuture.runAsync(() -> startDirectWatchStream(listener, requestBody))
                     .exceptionally(ex -> {
-                        log.error("Watch stream task failed: {}", watchId, ex);
+                        log.error("Direct watch stream task failed: {}", watchId, ex);
                         listener.onError(ex instanceof Exception ? (Exception) ex : new RuntimeException(ex));
                         activeWatches.remove(listener);
                         return null;
@@ -787,68 +756,72 @@ public class RaftKVClient {
             return listener;
 
         } catch (Exception e) {
-            log.error("Failed to create watch", e);
-            throw new RuntimeException("Failed to create watch", e);
+            log.error("Failed to create direct watch stream", e);
+            throw new RuntimeException("Failed to create direct watch stream", e);
         }
     }
 
     /**
-     * 启动 Watch 事件流监听
+     * 启动一步式 Watch 事件流监听（etcd 风格）
      */
-    private void startWatchStream(WatchListener listener) {
+    private void startDirectWatchStream(WatchListener listener, Map<String, Object> requestBody) {
         try {
-            String url = getCurrentLeader() + "/watch/" + listener.getWatchId();
-            HttpRequest.Builder requestBuilder = HttpRequest.newBuilder()
+            String url = getCurrentLeader() + "/watch/stream";
+            HttpRequest request = HttpRequest.newBuilder()
                     .uri(URI.create(url))
+                    .header("Content-Type", "application/json")
                     .header("Accept", "text/event-stream")
-                    .GET();
-            // 长连接：不设置超时，让连接一直保持
-            HttpRequest request = requestBuilder.build();
+                    .POST(HttpRequest.BodyPublishers.ofString(objectMapper.writeValueAsString(requestBody)))
+                    .build();
 
-            HttpResponse<java.io.InputStream> response = httpClient.send(request, 
+            HttpResponse<java.io.InputStream> response = httpClient.send(request,
                     HttpResponse.BodyHandlers.ofInputStream());
 
             if (response.statusCode() != 200) {
-                log.error("Watch stream failed: HTTP {}", response.statusCode());
+                log.error("Direct watch stream failed: HTTP {}", response.statusCode());
                 listener.onError(new RuntimeException("HTTP " + response.statusCode()));
                 return;
             }
 
-            // 读取 SSE 流
-            try (BufferedReader reader = new BufferedReader(
-                    new InputStreamReader(response.body()))) {
-                String line;
-                StringBuilder eventData = new StringBuilder();
-                String eventType = "";
-
-                while (!listener.isCancelled() && (line = reader.readLine()) != null) {
-                    if (line.startsWith("event:")) {
-                        eventType = line.substring(6).trim();
-                    } else if (line.startsWith("data:")) {
-                        // 多行 data 用换行符连接
-                        if (eventData.length() > 0) {
-                            eventData.append("\n");
-                        }
-                        eventData.append(line.substring(5).trim());
-                    } else if (line.isEmpty()) {
-                        // 事件结束（空行），处理事件
-                        if (eventData.length() > 0) {
-                            processWatchEvent(listener, eventType, eventData.toString());
-                            eventData.setLength(0);
-                            eventType = "";
-                        }
-                    }
-                }
-            }
-
-            log.info("Watch stream ended: {}", listener.getWatchId());
+            readSseStream(listener, response.body());
+            log.info("Direct watch stream ended: {}", listener.getWatchId());
             listener.onComplete();
 
         } catch (Exception e) {
-            log.error("Watch stream error: {}", listener.getWatchId(), e);
+            log.error("Direct watch stream error: {}", listener.getWatchId(), e);
             listener.onError(e);
         } finally {
             activeWatches.remove(listener);
+        }
+    }
+
+    /**
+     * 读取 SSE 流（复用的一步式和两步式通用逻辑）
+     */
+    private void readSseStream(WatchListener listener, java.io.InputStream inputStream) throws java.io.IOException {
+        try (BufferedReader reader = new BufferedReader(new InputStreamReader(inputStream))) {
+            String line;
+            StringBuilder eventData = new StringBuilder();
+            String eventType = "";
+
+            while (!listener.isCancelled() && (line = reader.readLine()) != null) {
+                if (line.startsWith("event:")) {
+                    eventType = line.substring(6).trim();
+                } else if (line.startsWith("data:")) {
+                    // 多行 data 用换行符连接
+                    if (eventData.length() > 0) {
+                        eventData.append("\n");
+                    }
+                    eventData.append(line.substring(5).trim());
+                } else if (line.isEmpty()) {
+                    // 事件结束（空行），处理事件
+                    if (eventData.length() > 0) {
+                        processWatchEvent(listener, eventType, eventData.toString());
+                        eventData.setLength(0);
+                        eventType = "";
+                    }
+                }
+            }
         }
     }
 
@@ -882,8 +855,12 @@ public class RaftKVClient {
      * @param watchId Watch ID
      */
     public void cancelWatch(String watchId) {
+        if (watchId == null) {
+            log.warn("cancelWatch called with null watchId");
+            return;
+        }
         activeWatches.stream()
-                .filter(w -> w.getWatchId().equals(watchId))
+                .filter(w -> watchId.equals(w.getWatchId()))
                 .findFirst()
                 .ifPresent(WatchListener::cancel);
 
@@ -943,52 +920,60 @@ public class RaftKVClient {
     // ==================== 事务支持 ====================
 
     /**
-     * 执行事务
-     *
-     * @param txnRequest 事务请求
-     * @return 事务响应
+     * 执行事务（使用独立重试逻辑）
      */
-    public TxnResponse transaction(TxnRequest txnRequest) {
+    private TxnResponse executeTransactionWithRetry(String operation, String endpoint, String jsonBody) {
         Exception lastException = null;
+        java.util.Set<String> triedEndpoints = new java.util.HashSet<>();
 
         for (int attempt = 1; attempt <= maxRetries; attempt++) {
             try {
-                log.debug("Attempt {} to execute transaction using leader: {}", attempt, currentLeader.get());
-
-                String url = getCurrentLeader() + "/txn";
+                String url = getCurrentLeader() + endpoint;
                 HttpRequest request = HttpRequest.newBuilder()
                         .uri(URI.create(url))
                         .timeout(Duration.ofSeconds(timeoutSeconds))
                         .header("Content-Type", "application/json")
-                        .POST(HttpRequest.BodyPublishers.ofString(objectMapper.writeValueAsString(txnRequest)))
+                        .POST(HttpRequest.BodyPublishers.ofString(jsonBody))
                         .build();
+                
+                HttpResponse<String> httpResponse = httpClient.send(request, HttpResponse.BodyHandlers.ofString());
 
-                HttpResponse<String> response = httpClient.send(request, HttpResponse.BodyHandlers.ofString());
-
-                // 处理重定向
-                if (response.statusCode() == 301) {
-                    String newLeader = response.headers().firstValue("Location")
-                            .map(loc -> loc.replace("http://", "").replace("/txn", ""))
-                            .orElse(null);
-                    if (newLeader != null) {
-                        log.info("Redirecting to Leader: {}", newLeader);
-                        updateLeader(newLeader);
+                if (httpResponse.statusCode() == 301) {
+                    String location = httpResponse.headers().firstValue("Location").orElse(null);
+                    if (location != null) {
+                        String leaderUrl = normalizeUrl(location.replace("http://", "").replace(endpoint, ""));
+                        updateLeader(leaderUrl);
                     }
-                    continue;  // 重试
+                    continue;
                 }
 
-                if (response.statusCode() != 200) {
-                    throw new RuntimeException("Transaction failed: HTTP " + response.statusCode());
+                if (httpResponse.statusCode() != 200) {
+                    throw new RuntimeException(operation + " failed: HTTP " + httpResponse.statusCode());
                 }
 
-                return objectMapper.readValue(response.body(), TxnResponse.class);
+                markEndpointHealthy(getCurrentLeader());
+                return objectMapper.readValue(httpResponse.body(), TxnResponse.class);
 
             } catch (Exception e) {
                 lastException = e;
-                log.warn("Transaction attempt {} failed: {}", attempt, e.getMessage());
+                String currentEndpoint = getCurrentLeader();
+                log.warn("{} attempt {} failed on {}: {}", operation, attempt, currentEndpoint, e.getMessage());
+
+                if (isConnectionFailure(e)) {
+                    markEndpointUnhealthy(currentEndpoint);
+                    triedEndpoints.add(currentEndpoint);
+                    String available = findAvailableEndpoint(triedEndpoints);
+                    if (available != null) {
+                        updateLeader(available);
+                        continue;
+                    }
+                }
 
                 if (attempt < maxRetries) {
-                    long waitTime = (long) Math.pow(2, attempt - 1) * 100;
+                    if (attempt == 1 && e instanceof java.net.http.HttpTimeoutException) {
+                        continue;
+                    }
+                    long waitTime = calculateBackoff(attempt);
                     try {
                         Thread.sleep(waitTime);
                     } catch (InterruptedException ie) {
@@ -999,16 +984,23 @@ public class RaftKVClient {
             }
         }
 
-        throw new RuntimeException("Transaction failed after " + maxRetries + " attempts", lastException);
+        throw new RuntimeException(operation + " failed after " + maxRetries + " attempts", lastException);
+    }
+
+    /**
+     * 执行事务
+     */
+    public TxnResponse transaction(TxnRequest txnRequest) {
+        try {
+            String jsonBody = objectMapper.writeValueAsString(txnRequest);
+            return executeTransactionWithRetry("TRANSACTION", "/txn", jsonBody);
+        } catch (Exception e) {
+            throw new RuntimeException("Failed to serialize transaction request", e);
+        }
     }
 
     /**
      * CAS（Compare-And-Swap）操作
-     *
-     * @param key key
-     * @param expectedValue 预期值
-     * @param newValue 新值
-     * @return 事务响应
      */
     public TxnResponse cas(String key, String expectedValue, String newValue) {
         Map<String, Object> request = new HashMap<>();
@@ -1016,62 +1008,16 @@ public class RaftKVClient {
         request.put("expectedValue", expectedValue);
         request.put("newValue", newValue);
 
-        Exception lastException = null;
-
-        for (int attempt = 1; attempt <= maxRetries; attempt++) {
-            try {
-                String url = getCurrentLeader() + "/txn/cas";
-                HttpRequest httpRequest = HttpRequest.newBuilder()
-                        .uri(URI.create(url))
-                        .timeout(Duration.ofSeconds(timeoutSeconds))
-                        .header("Content-Type", "application/json")
-                        .POST(HttpRequest.BodyPublishers.ofString(objectMapper.writeValueAsString(request)))
-                        .build();
-
-                HttpResponse<String> response = httpClient.send(httpRequest, HttpResponse.BodyHandlers.ofString());
-
-                if (response.statusCode() == 301) {
-                    String newLeader = response.headers().firstValue("Location")
-                            .map(loc -> loc.replace("http://", "").replace("/txn/cas", ""))
-                            .orElse(null);
-                    if (newLeader != null) {
-                        updateLeader(newLeader);
-                    }
-                    continue;
-                }
-
-                if (response.statusCode() != 200) {
-                    throw new RuntimeException("CAS failed: HTTP " + response.statusCode());
-                }
-
-                return objectMapper.readValue(response.body(), TxnResponse.class);
-
-            } catch (Exception e) {
-                lastException = e;
-                log.warn("CAS attempt {} failed: {}", attempt, e.getMessage());
-
-                if (attempt < maxRetries) {
-                    long waitTime = (long) Math.pow(2, attempt - 1) * 100;
-                    try {
-                        Thread.sleep(waitTime);
-                    } catch (InterruptedException ie) {
-                        Thread.currentThread().interrupt();
-                        throw new RuntimeException("Retry interrupted", ie);
-                    }
-                }
-            }
+        try {
+            String jsonBody = objectMapper.writeValueAsString(request);
+            return executeTransactionWithRetry("CAS", "/txn/cas", jsonBody);
+        } catch (Exception e) {
+            throw new RuntimeException("Failed to serialize CAS request", e);
         }
-
-        throw new RuntimeException("CAS failed after " + maxRetries + " attempts", lastException);
     }
-
+    
     /**
      * CAS 使用版本号
-     *
-     * @param key key
-     * @param expectedVersion 预期版本号
-     * @param newValue 新值
-     * @return 事务响应
      */
     public TxnResponse casWithVersion(String key, long expectedVersion, String newValue) {
         TxnRequest txnRequest = TxnRequest.builder()
@@ -1079,16 +1025,11 @@ public class RaftKVClient {
                 .success(java.util.List.of(Operation.put(key, newValue)))
                 .failure(java.util.List.of(Operation.get(key)))
                 .build();
-
         return transaction(txnRequest);
     }
-
+    
     /**
      * 获取分布式锁
-     *
-     * @param lockKey 锁的 key
-     * @param owner 锁的持有者标识
-     * @return true 如果获取锁成功
      */
     public boolean acquireLock(String lockKey, String owner) {
         Map<String, Object> request = new HashMap<>();
@@ -1096,42 +1037,17 @@ public class RaftKVClient {
         request.put("owner", owner);
 
         try {
-            String url = getCurrentLeader() + "/txn/lock";
-            HttpRequest httpRequest = HttpRequest.newBuilder()
-                    .uri(URI.create(url))
-                    .timeout(Duration.ofSeconds(timeoutSeconds))
-                    .header("Content-Type", "application/json")
-                    .POST(HttpRequest.BodyPublishers.ofString(objectMapper.writeValueAsString(request)))
-                    .build();
-
-            HttpResponse<String> response = httpClient.send(httpRequest, HttpResponse.BodyHandlers.ofString());
-
-            if (response.statusCode() == 301) {
-                String newLeader = response.headers().firstValue("Location")
-                        .map(loc -> loc.replace("http://", "").replace("/txn/lock", ""))
-                        .orElse(null);
-                if (newLeader != null) {
-                    updateLeader(newLeader);
-                    return acquireLock(lockKey, owner);  // 重试
-                }
-                return false;
-            }
-
-            TxnResponse txnResponse = objectMapper.readValue(response.body(), TxnResponse.class);
-            return txnResponse.isSucceeded();
-
+            String jsonBody = objectMapper.writeValueAsString(request);
+            TxnResponse response = executeTransactionWithRetry("ACQUIRE_LOCK", "/txn/lock", jsonBody);
+            return response.isSucceeded();
         } catch (Exception e) {
             log.error("Failed to acquire lock: {} for owner: {}", lockKey, owner, e);
             return false;
         }
     }
-
+    
     /**
      * 释放分布式锁
-     *
-     * @param lockKey 锁的 key
-     * @param owner 锁的持有者标识
-     * @return true 如果释放锁成功
      */
     public boolean releaseLock(String lockKey, String owner) {
         Map<String, Object> request = new HashMap<>();
@@ -1139,30 +1055,9 @@ public class RaftKVClient {
         request.put("owner", owner);
 
         try {
-            String url = getCurrentLeader() + "/txn/unlock";
-            HttpRequest httpRequest = HttpRequest.newBuilder()
-                    .uri(URI.create(url))
-                    .timeout(Duration.ofSeconds(timeoutSeconds))
-                    .header("Content-Type", "application/json")
-                    .POST(HttpRequest.BodyPublishers.ofString(objectMapper.writeValueAsString(request)))
-                    .build();
-
-            HttpResponse<String> response = httpClient.send(httpRequest, HttpResponse.BodyHandlers.ofString());
-
-            if (response.statusCode() == 301) {
-                String newLeader = response.headers().firstValue("Location")
-                        .map(loc -> loc.replace("http://", "").replace("/txn/unlock", ""))
-                        .orElse(null);
-                if (newLeader != null) {
-                    updateLeader(newLeader);
-                    return releaseLock(lockKey, owner);  // 重试
-                }
-                return false;
-            }
-
-            TxnResponse txnResponse = objectMapper.readValue(response.body(), TxnResponse.class);
-            return txnResponse.isSucceeded();
-
+            String jsonBody = objectMapper.writeValueAsString(request);
+            TxnResponse response = executeTransactionWithRetry("RELEASE_LOCK", "/txn/unlock", jsonBody);
+            return response.isSucceeded();
         } catch (Exception e) {
             log.error("Failed to release lock: {} for owner: {}", lockKey, owner, e);
             return false;

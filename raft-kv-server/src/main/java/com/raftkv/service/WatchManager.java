@@ -9,7 +9,7 @@ import org.springframework.context.annotation.Lazy;
 import org.springframework.stereotype.Component;
 import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
 
-import java.io.IOException;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
@@ -18,48 +18,33 @@ import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicLong;
 
 import javax.annotation.PostConstruct;
 import javax.annotation.PreDestroy;
 
 /**
  * Watch 管理器 - 管理所有的 Watch 订阅和事件分发
- * 
+ *
  * 核心职责：
- * 1. 管理活跃的 Watch 订阅（注册、取消、查询）
+ * 1. 管理活跃的 Watch 订阅（注册、关闭、查询）
  * 2. 将事件路由到匹配的订阅者
  * 3. 支持精确匹配和前缀匹配
  * 4. 处理客户端连接断开
- * 
- * 设计要点：
- * 1. 线程安全：使用 ConcurrentHashMap 和 CopyOnWriteArrayList
- * 2. 高效匹配：精确匹配 O(1)，前缀匹配 O(n)（n=活跃 watch 数量）
- * 3. 异步发送：事件发送不阻塞事件生产者
- * 
+ *
+ * 架构设计（一步式 etcd 风格）：
+ * - 每个 POST /watch/stream 请求创建一个 WatchSubscription（一对一）
+ * - exactMatchIndex：按 key 索引活跃订阅，O(1) 精确匹配
+ * - prefixWatches：按前缀索引活跃订阅，遍历匹配
+ *
  * 事件路由流程：
- * 1. KVStoreStateMachine.onApply 产生 WatchEvent
- * 2. WatchManager.publishEvent 接收事件
- * 3. 遍历所有活跃订阅，匹配 key（精确或前缀）
- * 4. 通过 SseEmitter 发送给客户端
+ * 1. 先写入历史记录（保证不丢失）
+ * 2. 再推送给活跃订阅者
  */
 @Component
 public class WatchManager {
 
     private static final Logger LOG = LoggerFactory.getLogger(WatchManager.class);
-
-    /**
-     * 默认的 SSE 超时时间（毫秒）
-     * 
-     * 0 表示不超时，保持长连接
-     */
-    private static final long DEFAULT_SSE_TIMEOUT = 0L;
-
-    /**
-     * 发送事件的超时时间（毫秒）
-     * 
-     * 如果超过此时间还发送失败，认为客户端已断开
-     */
-    private static final long SEND_TIMEOUT_MS = 5000;
 
     @Autowired
     private EventHistory eventHistory;
@@ -69,26 +54,23 @@ public class WatchManager {
     private RaftKVService raftKVService;
 
     /**
-     * 活跃的 Watch 订阅
-     * 
-     * Key: watchId
-     * Value: WatchSubscription
+     * 活跃的 Watch 订阅（一对一：一个 watchId 对应一个 SSE 连接）
      */
     private final Map<String, WatchSubscription> activeWatches = new ConcurrentHashMap<>();
 
     /**
-     * 精确匹配的 Watch 索引
-     * 
+     * 精确匹配的 Watch 订阅列表
+     *
      * Key: 监听的 key
-     * Value: 监听该 key 的 watchId 列表
-     * 
+     * Value: 监听该 key 的 WatchSubscription 列表
+     *
      * 用于 O(1) 快速查找精确匹配的订阅
      */
-    private final Map<String, List<String>> exactMatchIndex = new ConcurrentHashMap<>();
+    private final Map<String, List<WatchSubscription>> exactMatchIndex = new ConcurrentHashMap<>();
 
     /**
      * 前缀匹配的 Watch 列表
-     * 
+     *
      * 存储所有前缀匹配的订阅
      * 事件到来时遍历此列表进行前缀匹配
      */
@@ -104,17 +86,82 @@ public class WatchManager {
     });
 
     /**
-     * Watch 订阅内部类
+     * 注册新的 SSE 连接（一对一）
      */
-    private static class WatchSubscription {
-        final String watchId;
-        final String key;
-        final boolean prefix;
-        final long startRevision;
-        final SseEmitter emitter;
-        volatile boolean closed = false;
+    public void registerConnection(WatchSubscription subscription) {
+        // 直接覆盖：同一个 watchId 的新连接会替换旧连接，
+        // 旧连接的 onCompletion 回调会在之后触发 closeWatch，安全清理
+        activeWatches.put(subscription.watchId, subscription);
 
-        WatchSubscription(String watchId, String key, boolean prefix, 
+        if (subscription.prefix) {
+            prefixWatches.add(subscription);
+        } else {
+            exactMatchIndex.computeIfAbsent(subscription.key, k -> new CopyOnWriteArrayList<>())
+                    .add(subscription);
+        }
+
+        LOG.info("Registered SSE connection for watch: {}, key={}",
+                subscription.watchId, subscription.key);
+    }
+
+    /**
+     * 关闭指定的 Watch 连接（线程安全）
+     */
+    public void closeWatch(String watchId, WatchSubscription subscription) {
+        if (subscription == null) {
+            return;
+        }
+        subscription.closed = true;
+
+        // 从活跃列表中移除（仅当当前 subscription 与存储的匹配时才移除，防止误删新连接）
+        activeWatches.computeIfPresent(watchId, (k, sub) -> sub == subscription ? null : sub);
+
+        // 从索引中移除
+        if (subscription.prefix) {
+            prefixWatches.remove(subscription);
+        } else {
+            exactMatchIndex.computeIfPresent(subscription.key, (k, subs) -> {
+                subs.remove(subscription);
+                return subs.isEmpty() ? null : subs;
+            });
+        }
+
+        // 完成 emitter（防止重复 complete）
+        if (!subscription.completed) {
+            subscription.completed = true;
+            try {
+                subscription.emitter.complete();
+            } catch (Exception e) {
+                // 忽略
+            }
+        }
+
+        LOG.debug("Closed SSE connection for watch: {}", watchId);
+    }
+
+    /**
+     * 获取订阅
+     */
+    public WatchSubscription getSubscription(String watchId) {
+        return activeWatches.get(watchId);
+    }
+
+    /**
+     * Watch 订阅（SSE 连接）
+     */
+    public static class WatchSubscription {
+        public final String watchId;
+        public final String key;
+        public final boolean prefix;
+        public final long startRevision;
+        public final SseEmitter emitter;
+        public volatile boolean closed = false;
+        // 标记 emitter 是否已完成，防止重复调用 complete()
+        public volatile boolean completed = false;
+        // 记录最后一次发送的 revision，用于保证版本号单调递增，防止重复发送
+        public final AtomicLong lastSentRevision = new AtomicLong(-1);
+
+        public WatchSubscription(String watchId, String key, boolean prefix,
                          long startRevision, SseEmitter emitter) {
             this.watchId = watchId;
             this.key = key;
@@ -125,12 +172,14 @@ public class WatchManager {
     }
 
     /**
-     * 初始化 - 启动清理任务
+     * 初始化 - 启动清理和心跳任务
      */
     @PostConstruct
     public void init() {
         // 每 30 秒清理一次已关闭的 Watch
-        cleanupExecutor.scheduleWithFixedDelay(this::cleanupClosedWatches, 30, 30, TimeUnit.SECONDS);
+        cleanupExecutor.scheduleWithFixedDelay(this::cleanupExpiredData, 30, 30, TimeUnit.SECONDS);
+        // 每 30 秒发送一次心跳，防止中间代理因 idle 超时而断开 SSE
+        cleanupExecutor.scheduleWithFixedDelay(this::sendHeartbeats, 30, 30, TimeUnit.SECONDS);
         LOG.info("WatchManager initialized");
     }
 
@@ -142,7 +191,7 @@ public class WatchManager {
         cleanupExecutor.shutdown();
         activeWatches.values().forEach(sub -> {
             sub.closed = true;
-            sub.emitter.complete();
+            try { sub.emitter.complete(); } catch (Exception e) {}
         });
         activeWatches.clear();
         exactMatchIndex.clear();
@@ -151,114 +200,90 @@ public class WatchManager {
     }
 
     /**
-     * 创建新的 Watch 订阅
-     * 
-     * @param request Watch 请求
-     * @return Watch ID
+     * 清理已关闭的 Watch 连接（兜底任务）
      */
-    public String createWatch(WatchRequest request) {
-        // 生成 watchId
-        String watchId = request.getWatchId() != null ? 
-                request.getWatchId() : UUID.randomUUID().toString();
-
-        // 创建 SSE Emitter
-        SseEmitter emitter = new SseEmitter(DEFAULT_SSE_TIMEOUT);
-
-        // 创建订阅对象
-        WatchSubscription subscription = new WatchSubscription(
-                watchId, request.getKey(), request.isPrefix(), 
-                request.getStartRevision(), emitter);
-
-        // 存储订阅
-        activeWatches.put(watchId, subscription);
-
-        // 添加到索引
-        if (request.isPrefix()) {
-            prefixWatches.add(subscription);
-        } else {
-            exactMatchIndex.computeIfAbsent(request.getKey(), k -> new CopyOnWriteArrayList<>())
-                    .add(watchId);
-        }
-
-        // 设置关闭回调
-        emitter.onCompletion(() -> {
-            LOG.debug("Watch completed: {}", watchId);
-            closeWatch(watchId);
+    private void cleanupExpiredData() {
+        activeWatches.entrySet().removeIf(entry -> {
+            WatchSubscription sub = entry.getValue();
+            if (sub.closed) {
+                if (!sub.completed) {
+                    sub.completed = true;
+                    try { sub.emitter.complete(); } catch (Exception e) {}
+                }
+                return true;
+            }
+            return false;
         });
-        emitter.onTimeout(() -> {
-            LOG.warn("Watch timeout: {}", watchId);
-            closeWatch(watchId);
-        });
-        emitter.onError(e -> {
-            LOG.error("Watch error: {}", watchId, e);
-            closeWatch(watchId);
-        });
-
-        // 如果有 startRevision，先发送历史事件
-        if (request.getStartRevision() > 0) {
-            sendHistoricalEvents(subscription);
-        }
-
-        // 发送初始事件（当前 revision）
-        sendInitialEvent(subscription);
-
-        LOG.info("Created watch: id={}, key={}, prefix={}, startRevision={}",
-                watchId, request.getKey(), request.isPrefix(), request.getStartRevision());
-
-        return watchId;
     }
 
     /**
-     * 获取指定 Watch ID 的 SSE Emitter
-     * 
-     * @param watchId Watch ID
-     * @return SseEmitter，如果不存在返回 null
+     * 发送心跳到所有活跃连接
+     *
+     * 防止 Nginx/ALB 等中间代理因 idle 超时而断开 SSE。
+     * 心跳发送失败说明连接已死，立即触发清理。
      */
-    public SseEmitter getEmitter(String watchId) {
-        WatchSubscription subscription = activeWatches.get(watchId);
-        return subscription != null ? subscription.emitter : null;
+    private void sendHeartbeats() {
+        long now = System.currentTimeMillis();
+        // 拷贝避免遍历期间 closeWatch 修改 Map
+        for (WatchSubscription sub : new ArrayList<>(activeWatches.values())) {
+            if (sub.closed || sub.completed) {
+                continue;
+            }
+            try {
+                SseEmitter.SseEventBuilder heartbeat = SseEmitter.event()
+                        .name("heartbeat")
+                        .data("{\"time\":" + now + ",\"watchId\":\"" + sub.watchId + "\"}");
+                sub.emitter.send(heartbeat);
+                LOG.debug("Sent heartbeat to watch: {}", sub.watchId);
+            } catch (Exception e) {
+                LOG.warn("Heartbeat failed for watch {}, closing: {}", sub.watchId, e.getMessage());
+                closeWatch(sub.watchId, sub);
+            }
+        }
     }
 
     /**
-     * 关闭指定的 Watch
-     * 
-     * @param watchId Watch ID
+     * 发送初始化事件（当前 revision）
      */
-    public void closeWatch(String watchId) {
-        WatchSubscription subscription = activeWatches.remove(watchId);
-        if (subscription == null) {
+    public void sendInitialEvent(WatchSubscription subscription) throws Exception {
+        long currentRevision = raftKVService.getCurrentRevision();
+        SseEmitter.SseEventBuilder initEvent = SseEmitter.event()
+                .name("init")
+                .data("{\"watchId\":\"" + subscription.watchId + "\",\"currentRevision\":" + currentRevision + "}");
+        subscription.emitter.send(initEvent);
+    }
+
+    /**
+     * 发送历史事件
+     */
+    public void sendHistoricalEvents(WatchSubscription subscription) {
+        List<WatchEvent> events = eventHistory.getEventsFrom(subscription.startRevision);
+        if (events.isEmpty()) {
             return;
         }
 
-        subscription.closed = true;
+        for (WatchEvent event : events) {
+            if (subscription.closed) {
+                break;
+            }
 
-        // 从索引中移除
-        if (subscription.prefix) {
-            prefixWatches.remove(subscription);
-        } else {
-            List<String> watchIds = exactMatchIndex.get(subscription.key);
-            if (watchIds != null) {
-                watchIds.remove(watchId);
-                if (watchIds.isEmpty()) {
-                    exactMatchIndex.remove(subscription.key);
+            if (subscription.prefix) {
+                if (!event.getKey().startsWith(subscription.key)) {
+                    continue;
+                }
+            } else {
+                if (!event.getKey().equals(subscription.key)) {
+                    continue;
                 }
             }
-        }
 
-        // 完成 emitter
-        try {
-            subscription.emitter.complete();
-        } catch (Exception e) {
-            // 忽略
+            // 使用 safeSendEvent 保证版本号单调递增，防止重复发送
+            safeSendEvent(subscription, event);
         }
-
-        LOG.info("Closed watch: {}", watchId);
     }
 
     /**
      * 发布事件到所有匹配的订阅
-     * 
-     * @param event Watch 事件
      */
     public void publishEvent(WatchEvent event) {
         if (event == null) {
@@ -267,120 +292,58 @@ public class WatchManager {
 
         String key = event.getKey();
 
-        // 1. 精确匹配
-        List<String> exactWatchIds = exactMatchIndex.get(key);
-        if (exactWatchIds != null) {
-            for (String watchId : exactWatchIds) {
-                WatchSubscription sub = activeWatches.get(watchId);
-                if (sub != null && !sub.closed) {
-                    sendEvent(sub, event);
+        // 1. 先写入历史记录（保证新连接的客户端能获取）
+        eventHistory.addEvent(event);
+
+        // 2. 再分发给当前的活跃订阅者（使用 safeSendEvent 保证幂等性）
+        List<WatchSubscription> exactSubs = exactMatchIndex.get(key);
+        if (exactSubs != null) {
+            for (WatchSubscription sub : exactSubs) {
+                if (!sub.closed) {
+                    safeSendEvent(sub, event);
                 }
             }
         }
 
-        // 2. 前缀匹配
         for (WatchSubscription sub : prefixWatches) {
             if (!sub.closed && key.startsWith(sub.key)) {
-                sendEvent(sub, event);
+                safeSendEvent(sub, event);
             }
         }
-
-        // 3. 添加到历史记录
-        eventHistory.addEvent(event);
     }
 
     /**
-     * 发送事件到指定订阅
+     * 安全发送事件（保证版本号单调递增，防止重复发送）
      */
-    private void sendEvent(WatchSubscription sub, WatchEvent event) {
-        try {
-            // 只发送 revision >= startRevision 的事件
-            if (event.getRevision() < sub.startRevision) {
+    private void safeSendEvent(WatchSubscription sub, WatchEvent event) {
+        // 只发送 revision >= startRevision 的事件
+        if (event.getRevision() < sub.startRevision) {
+            return;
+        }
+
+        // 利用 CAS 保证版本号单调递增，去重并防乱序
+        while (true) {
+            long currentLast = sub.lastSentRevision.get();
+            if (event.getRevision() <= currentLast) {
+                // 已经发送过更新或相同的版本，直接跳过
                 return;
             }
+            if (sub.lastSentRevision.compareAndSet(currentLast, event.getRevision())) {
+                break;
+            }
+            // 其他线程修改了 lastSentRevision，重试
+        }
 
+        try {
             SseEmitter.SseEventBuilder eventBuilder = SseEmitter.event()
                     .name(event.getType().name().toLowerCase())
                     .data(event);
-
             sub.emitter.send(eventBuilder);
             LOG.debug("Sent event to watch {}: revision={}, key={}",
                     sub.watchId, event.getRevision(), event.getKey());
         } catch (Exception e) {
-            // 捕获所有异常，包括 IOException 和 IllegalStateException（emitter 已关闭）
             LOG.warn("Failed to send event to watch {}, closing: {}", sub.watchId, e.getMessage());
-            closeWatch(sub.watchId);
-        }
-    }
-
-    /**
-     * 发送历史事件
-     */
-    private void sendHistoricalEvents(WatchSubscription sub) {
-        List<WatchEvent> events = eventHistory.getEventsFrom(sub.startRevision);
-        if (events.isEmpty()) {
-            LOG.info("No historical events available for watch {} from revision {}", 
-                    sub.watchId, sub.startRevision);
-            return;
-        }
-
-        LOG.info("Sending {} historical events to watch {}", events.size(), sub.watchId);
-
-        // 复制列表，避免在遍历时被修改
-        List<WatchEvent> eventsCopy = new java.util.ArrayList<>(events);
-        
-        for (WatchEvent event : eventsCopy) {
-            if (sub.closed) {
-                break;
-            }
-
-            // 检查 key 是否匹配
-            if (sub.prefix) {
-                if (!event.getKey().startsWith(sub.key)) {
-                    continue;
-                }
-            } else {
-                if (!event.getKey().equals(sub.key)) {
-                    continue;
-                }
-            }
-
-            sendEvent(sub, event);
-        }
-    }
-
-    /**
-     * 发送初始事件（通知客户端当前 revision）
-     */
-    private void sendInitialEvent(WatchSubscription sub) {
-        try {
-            long currentRevision = raftKVService.getCurrentRevision();
-            SseEmitter.SseEventBuilder initEvent = SseEmitter.event()
-                    .name("init")
-                    .data("{\"watchId\":\"" + sub.watchId + "\",\"currentRevision\":" + currentRevision + "}");
-            sub.emitter.send(initEvent);
-        } catch (Exception e) {
-            LOG.warn("Failed to send init event to watch {}: {}", sub.watchId, e.getMessage());
-            closeWatch(sub.watchId);
-        }
-    }
-
-    /**
-     * 清理已关闭的 Watch
-     */
-    private void cleanupClosedWatches() {
-        int count = 0;
-        // 复制 key 列表，避免在遍历时修改 Map
-        List<String> watchIds = new java.util.ArrayList<>(activeWatches.keySet());
-        for (String watchId : watchIds) {
-            WatchSubscription sub = activeWatches.get(watchId);
-            if (sub != null && sub.closed) {
-                closeWatch(watchId);
-                count++;
-            }
-        }
-        if (count > 0) {
-            LOG.debug("Cleaned up {} closed watches", count);
+            closeWatch(sub.watchId, sub);
         }
     }
 
@@ -395,6 +358,7 @@ public class WatchManager {
      * 检查 Watch 是否存在
      */
     public boolean hasWatch(String watchId) {
-        return activeWatches.containsKey(watchId);
+        WatchSubscription sub = activeWatches.get(watchId);
+        return sub != null && !sub.closed;
     }
 }
