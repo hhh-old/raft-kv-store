@@ -1,6 +1,7 @@
 package com.raftkv.controller;
 
 import com.raftkv.entity.WatchRequest;
+import com.raftkv.service.EventHistory;
 import com.raftkv.service.RaftKVService;
 import com.raftkv.service.WatchManager;
 import com.raftkv.service.WatchManager.WatchSubscription;
@@ -44,6 +45,9 @@ public class WatchController {
     @Autowired
     private RaftKVService raftKVService;
 
+    @Autowired
+    private EventHistory eventHistory;
+
     private static final long DEFAULT_SSE_TIMEOUT = 0L; // 0 = 永不超时，由心跳保活
 
     /**
@@ -65,6 +69,24 @@ public class WatchController {
     public ResponseBodyEmitter watchStream(@RequestBody WatchRequest request) {
         log.info("Watch stream: key={}, prefix={}, startRevision={}",
                 request.getKey(), request.isPrefix(), request.getStartRevision());
+
+        // Leader 校验：非 Leader 节点拒绝建立 Watch 连接，防止客户端吸附在僵尸连接上
+        if (!raftKVService.isLeader()) {
+            String leaderUrl = raftKVService.getLeaderHttpUrl();
+            log.warn("Rejecting watch request on non-leader node. Current leader: {}", leaderUrl);
+            SseEmitter errorEmitter = new SseEmitter(0L);
+            CompletableFuture.runAsync(() -> {
+                try {
+                    errorEmitter.send(SseEmitter.event()
+                            .name("error")
+                            .data("{\"code\":\"NOT_LEADER\",\"leaderUrl\":\"" + leaderUrl + "\"}"));
+                    errorEmitter.complete();
+                } catch (Exception e) {
+                    errorEmitter.completeWithError(e);
+                }
+            });
+            return errorEmitter;
+        }
 
         String watchId = request.getWatchId() != null ?
                 request.getWatchId() : java.util.UUID.randomUUID().toString();
@@ -160,6 +182,20 @@ public class WatchController {
         Map<String, Object> response = new HashMap<>();
         response.put("revision", raftKVService.getCurrentRevision());
         response.put("activeWatches", watchManager.getActiveWatchCount());
+        return ResponseEntity.ok(response);
+    }
+
+    /**
+     * 获取当前最小可用 revision（管理接口）
+     *
+     * 客户端可据此判断断线后能否用当前 lastReceivedRevision 继续追赶历史事件。
+     */
+    @GetMapping("/compact-revision")
+    public ResponseEntity<Map<String, Object>> getCompactRevision() {
+        Map<String, Object> response = new HashMap<>();
+        response.put("oldestRevision", eventHistory.getOldestRevision());
+        response.put("latestRevision", eventHistory.getLatestRevision());
+        response.put("eventCount", eventHistory.getEventCount());
         return ResponseEntity.ok(response);
     }
 

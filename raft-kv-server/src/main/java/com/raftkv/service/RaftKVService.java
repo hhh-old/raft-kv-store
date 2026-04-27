@@ -49,6 +49,9 @@ public class RaftKVService {
     @Autowired
     private WatchManager watchManager;
 
+    @Autowired
+    private MVCCStore mvccStore;
+
     private RaftGroupService raftGroupService;
     private Node node;
     private KVStoreStateMachine stateMachine;
@@ -195,8 +198,8 @@ public class RaftKVService {
         // 2. onSnapshotSave/onSnapshotLoad: 快照的保存和加载
         // 3. onLeaderStart/onLeaderStop: 领导权变更通知
         // 状态机保证了所有节点以相同的顺序应用相同的操作，从而实现数据一致性
-        stateMachine = new KVStoreStateMachine();
-        
+        stateMachine = new KVStoreStateMachine(mvccStore);
+
         // 注入 WatchManager，用于生成 Watch 事件
         stateMachine.setWatchManager(watchManager);
         

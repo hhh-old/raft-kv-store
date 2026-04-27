@@ -10,6 +10,8 @@ import org.springframework.stereotype.Component;
 import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
 
 import java.util.ArrayList;
+import java.util.Collections;
+import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
@@ -52,6 +54,9 @@ public class WatchManager {
     @Autowired
     @Lazy
     private RaftKVService raftKVService;
+
+    @Autowired
+    private MVCCStore mvccStore;
 
     /**
      * 活跃的 Watch 订阅（一对一：一个 watchId 对应一个 SSE 连接）
@@ -224,6 +229,7 @@ public class WatchManager {
      */
     private void sendHeartbeats() {
         long now = System.currentTimeMillis();
+        boolean isLeader = raftKVService != null && raftKVService.isLeader();
         // 拷贝避免遍历期间 closeWatch 修改 Map
         for (WatchSubscription sub : new ArrayList<>(activeWatches.values())) {
             if (sub.closed || sub.completed) {
@@ -232,7 +238,7 @@ public class WatchManager {
             try {
                 SseEmitter.SseEventBuilder heartbeat = SseEmitter.event()
                         .name("heartbeat")
-                        .data("{\"time\":" + now + ",\"watchId\":\"" + sub.watchId + "\"}");
+                        .data("{\"time\":" + now + ",\"watchId\":\"" + sub.watchId + "\",\"isLeader\":" + isLeader + "}");
                 sub.emitter.send(heartbeat);
                 LOG.debug("Sent heartbeat to watch: {}", sub.watchId);
             } catch (Exception e) {
@@ -247,18 +253,41 @@ public class WatchManager {
      */
     public void sendInitialEvent(WatchSubscription subscription) throws Exception {
         long currentRevision = raftKVService.getCurrentRevision();
+        boolean isLeader = raftKVService.isLeader();
         SseEmitter.SseEventBuilder initEvent = SseEmitter.event()
                 .name("init")
-                .data("{\"watchId\":\"" + subscription.watchId + "\",\"currentRevision\":" + currentRevision + "}");
+                .data("{\"watchId\":\"" + subscription.watchId + "\",\"currentRevision\":" + currentRevision + ",\"isLeader\":" + isLeader + "}");
         subscription.emitter.send(initEvent);
     }
 
     /**
-     * 发送历史事件
+     * 发送历史事件（单轨实现：仅依赖 EventHistory）
+     *
+     * 设计原则：
+     * - EventHistory 是唯一的历史事件来源，由 publishEvent 实时写入 + onLeaderStart 的 prefill 共同维护
+     * - 节点成为 Leader 时，prefillFromMvcc 会将 MVCCStore 的历史反推填充到 EventHistory，
+     *   避免运行时并发查询 MVCCStore 导致的竞态（已写入未发布的版本被误读）
+     * - 如果请求的 revision 比 EventHistory 的 oldestRevision 更老，则发送 COMPACT_REVISION 错误
      */
     public void sendHistoricalEvents(WatchSubscription subscription) {
+        if (subscription.startRevision <= 0) {
+            // startRevision <= 0 表示只订阅实时事件，不发送历史
+            return;
+        }
+
+        // 仅从 EventHistory 获取历史事件（单一来源，无并发竞态）
         List<WatchEvent> events = eventHistory.getEventsFrom(subscription.startRevision);
+
         if (events.isEmpty()) {
+            // EventHistory 为空或请求 revision 已被 compaction
+            long oldestRevision = eventHistory.getOldestRevision();
+            if (oldestRevision > 0 && subscription.startRevision < oldestRevision) {
+                // revision 已被 compaction，通知客户端
+                sendErrorEvent(subscription, "COMPACT_REVISION",
+                        "Requested revision " + subscription.startRevision + " has been compacted, oldest available is " + oldestRevision,
+                        oldestRevision);
+            }
+            // 否则：startRevision >= latestRevision，没有需要回放的历史事件，直接返回
             return;
         }
 
@@ -279,6 +308,80 @@ public class WatchManager {
 
             // 使用 safeSendEvent 保证版本号单调递增，防止重复发送
             safeSendEvent(subscription, event);
+        }
+    }
+
+    /**
+     * 从 MVCCStore 反推历史事件并预填充 EventHistory
+     *
+     * 调用时机：
+     * - 节点成为 Leader 时（KVStoreStateMachine.onLeaderStart）
+     * - onLeaderStart 与 onApply 在 Raft 内部串行调度，保证 prefill 与 publishEvent 不会并发穿插
+     *
+     * 设计要点：
+     * 1. 直接扫描 MVCCStore.keyIndex 反推 WatchEvent
+     * 2. 取最近 maxEvents 条 revision（按 revision 降序 top-N，再按升序插入）
+     * 3. 通过 EventHistory.prefillOlderEvents（synchronized）插入，自动去重与容量裁剪
+     *
+     * @param maxEvents 最多预填充的事件数量（受限于 EventHistory 容量）
+     */
+    public void prefillFromMvcc(int maxEvents) {
+        if (maxEvents <= 0) {
+            return;
+        }
+        try {
+            // 扫描所有 key 的历史版本，反推 WatchEvent
+            List<WatchEvent> events = new ArrayList<>();
+            for (String key : mvccStore.getAllKeys()) {
+                java.util.NavigableMap<MVCCStore.Revision, MVCCStore.KeyValue> history = mvccStore.getHistory(key);
+                for (java.util.Map.Entry<MVCCStore.Revision, MVCCStore.KeyValue> entry : history.entrySet()) {
+                    long mainRev = entry.getKey().getMainRev();
+                    MVCCStore.KeyValue kv = entry.getValue();
+                    WatchEvent event = (kv.getValue() == null)
+                            ? WatchEvent.delete(key, mainRev, kv.getCreateRevision().getMainRev(), kv.getVersion())
+                            : WatchEvent.put(key, kv.getValue(), mainRev, kv.getCreateRevision().getMainRev(), kv.getVersion());
+                    events.add(event);
+                }
+            }
+
+            if (events.isEmpty()) {
+                LOG.info("prefillFromMvcc: MVCCStore has no events to prefill");
+                return;
+            }
+
+            events.sort(Comparator.comparingLong(WatchEvent::getRevision));
+
+            // 只取最近 maxEvents 条
+            List<WatchEvent> recent;
+            if (events.size() > maxEvents) {
+                recent = events.subList(events.size() - maxEvents, events.size());
+            } else {
+                recent = events;
+            }
+
+            eventHistory.prefillOlderEvents(recent);
+            LOG.info("prefillFromMvcc completed: scanned={}, prefilled={}", events.size(), recent.size());
+        } catch (Exception e) {
+            LOG.error("prefillFromMvcc failed: {}", e.getMessage(), e);
+        }
+    }
+
+    /**
+     * 发送错误事件到指定订阅
+     */
+    private void sendErrorEvent(WatchSubscription sub, String code, String message, long oldestRevision) {
+        if (sub.closed || sub.completed) {
+            return;
+        }
+        try {
+            SseEmitter.SseEventBuilder errorEvent = SseEmitter.event()
+                    .name("error")
+                    .data("{\"code\":\"" + code + "\",\"message\":\"" + message + "\",\"oldestRevision\":" + oldestRevision + "}");
+            sub.emitter.send(errorEvent);
+            LOG.warn("Sent error event to watch {}: code={}, oldestRevision={}", sub.watchId, code, oldestRevision);
+        } catch (Exception e) {
+            LOG.warn("Failed to send error event to watch {}, closing: {}", sub.watchId, e.getMessage());
+            closeWatch(sub.watchId, sub);
         }
     }
 

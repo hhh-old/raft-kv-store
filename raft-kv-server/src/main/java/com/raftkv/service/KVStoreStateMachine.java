@@ -53,8 +53,8 @@ public class KVStoreStateMachine extends StateMachineAdapter {
     // ==================== MVCC 存储引擎 ====================
     // 使用 MVCC 替代简单的 HashMap，支持多版本和乐观并发控制
     // 所有读写操作都通过 MVCCStore 进行
-    private final MVCCStore mvccStore = new MVCCStore();
-    
+    private MVCCStore mvccStore;
+
     /**
      * 已处理请求的缓存（用于幂等去重）
      * Key: requestId
@@ -123,7 +123,14 @@ public class KVStoreStateMachine extends StateMachineAdapter {
     public KVStoreStateMachine() {
         // 数据目录由 Raft 管理，状态机不再需要自己管理文件
         // 所有持久化工作交给 Raft 的 Snapshot 机制
-        LOG.info("KVStoreStateMachine initialized");
+        this.mvccStore = new MVCCStore();
+        LOG.info("KVStoreStateMachine initialized (standalone)");
+    }
+
+    public KVStoreStateMachine(MVCCStore mvccStore) {
+        // 使用外部注入的 MVCCStore（Spring 容器管理，保证单例）
+        this.mvccStore = mvccStore;
+        LOG.info("KVStoreStateMachine initialized (with injected MVCCStore)");
     }
 
     /**
@@ -578,6 +585,23 @@ public class KVStoreStateMachine extends StateMachineAdapter {
         LOG.info("onLeaderStart: term={}", term);
         this.leaderTerm.set(term);
         currentTerm.set(term);
+
+        // 方案一：节点成为 Leader 时，从 MVCCStore 反推历史事件预填充 EventHistory
+        // 意义：
+        // 1. 消除 Leader 切换后新 Leader EventHistory 为空导致客户端请求历史 revision 失败的问题
+        // 2. 配合 WatchManager 的单轨 sendHistoricalEvents 实现（去除运行时 MVCC fallback），
+        //    彻底解决"已写入 MVCC 但尚未发布"版本被误读导致的重复/乱序事件问题
+        // 时序安全性：
+        // - onLeaderStart 与 onApply 在 Raft 内部串行调度，此时 publishEvent 不会并发穿插
+        // - EventHistory.prefillOlderEvents 是 synchronized，与后续 addEvent 互斥
+        if (watchManager != null) {
+            try {
+                // 预填充容量与 EventHistory 容量保持一致
+                watchManager.prefillFromMvcc(EventHistory.DEFAULT_CAPACITY);
+            } catch (Exception e) {
+                LOG.error("Failed to prefill EventHistory on leader start: {}", e.getMessage(), e);
+            }
+        }
     }
 
     /**

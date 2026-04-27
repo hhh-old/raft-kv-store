@@ -5,6 +5,7 @@ import com.raftkv.entity.*;
 import lombok.extern.slf4j.Slf4j;
 
 import java.io.BufferedReader;
+import java.io.IOException;
 import java.io.InputStreamReader;
 import java.net.URI;
 import java.net.http.HttpClient;
@@ -333,7 +334,36 @@ public class RaftKVClient {
     }
 
     /**
-     * 获取集群统计信息
+     * 遍历所有配置的节点，找到当前 Leader 并更新内部 Leader 引用。
+     *
+     * @return Leader 的 HTTP 端点（如 http://127.0.0.1:9081），找不到返回 null
+     */
+    public String findLeader() {
+        for (String url : serverUrls) {
+            try {
+                String endpoint = normalizeUrl(url);
+                HttpRequest request = HttpRequest.newBuilder()
+                        .uri(URI.create(endpoint + "/kv/stats"))
+                        .timeout(Duration.ofSeconds(timeoutSeconds))
+                        .GET()
+                        .build();
+                HttpResponse<String> response = httpClient.send(request, HttpResponse.BodyHandlers.ofString());
+                if (response.statusCode() == 200) {
+                    java.util.Map stats = objectMapper.readValue(response.body(), java.util.Map.class);
+                    if ("LEADER".equals(stats.get("role"))) {
+                        updateLeader(endpoint);
+                        return endpoint;
+                    }
+                }
+            } catch (Exception e) {
+                log.debug("Find leader failed on {}: {}", url, e.getMessage());
+            }
+        }
+        return null;
+    }
+
+    /**
+     * 获取集群统计信息（查询当前 Leader）
      */
     public String getStats() {
         try {
@@ -800,7 +830,7 @@ public class RaftKVClient {
     }
 
     /**
-     * 启动一步式 Watch 事件流监听（单次连接）
+     * 启动一步式 Watch 事件流监听（单次连接），支持跨节点故障转移
      */
     private void startDirectWatchStream(WatchListener listener) throws Exception {
         // 每次连接生成新的 watchId，旧连接由服务端在检测到断开后自动清理
@@ -814,28 +844,64 @@ public class RaftKVClient {
         requestBody.put("startRevision", listener.getNextStartRevision());
         requestBody.put("watchId", newWatchId);
 
-        String url = getCurrentLeader() + "/watch/stream";
-        HttpRequest request = HttpRequest.newBuilder()
-                .uri(URI.create(url))
-                .header("Content-Type", "application/json")
-                .header("Accept", "text/event-stream")
-                .POST(HttpRequest.BodyPublishers.ofString(objectMapper.writeValueAsString(requestBody)))
-                .build();
+        String jsonBody = objectMapper.writeValueAsString(requestBody);
+        java.util.Set<String> triedEndpoints = new java.util.HashSet<>();
+        Exception lastException = null;
 
-        HttpResponse<java.io.InputStream> response = httpClient.send(request,
-                HttpResponse.BodyHandlers.ofInputStream());
+        while (triedEndpoints.size() < serverUrls.size()) {
+            String endpoint = getCurrentLeader();
+            if (triedEndpoints.contains(endpoint)) {
+                String available = findAvailableEndpoint(triedEndpoints);
+                if (available == null) break;
+                endpoint = available;
+                updateLeader(endpoint);
+            }
+            triedEndpoints.add(endpoint);
 
-        if (response.statusCode() != 200) {
-            throw new RuntimeException("HTTP " + response.statusCode());
+            String url = endpoint + "/watch/stream";
+            HttpRequest request = HttpRequest.newBuilder()
+                    .uri(URI.create(url))
+                    .header("Content-Type", "application/json")
+                    .header("Accept", "text/event-stream")
+                    .POST(HttpRequest.BodyPublishers.ofString(jsonBody))
+                    .build();
+
+            try {
+                HttpResponse<java.io.InputStream> response = httpClient.send(request,
+                        HttpResponse.BodyHandlers.ofInputStream());
+
+                if (response.statusCode() != 200) {
+                    // 服务端明确返回 503 且带 Leader-Url，切换到新 Leader 重试
+                    if (response.statusCode() == 503) {
+                        String leaderUrl = response.headers().firstValue("Leader-Url").orElse(null);
+                        if (leaderUrl != null) {
+                            updateLeader(leaderUrl);
+                            continue;
+                        }
+                    }
+                    throw new RuntimeException("HTTP " + response.statusCode());
+                }
+
+                readSseStream(listener, response.body());
+                return; // 正常结束（服务端关闭连接或客户端取消）
+
+            } catch (Exception e) {
+                lastException = e;
+                if (isConnectionFailure(e)) {
+                    markEndpointUnhealthy(endpoint);
+                }
+                log.warn("Watch connection failed on {}: {}", endpoint, e.getMessage());
+                // 继续尝试下一个可用节点
+            }
         }
 
-        readSseStream(listener, response.body());
+        throw lastException != null ? lastException : new RuntimeException("All endpoints failed for watch");
     }
 
     /**
      * 读取 SSE 流（复用的一步式和两步式通用逻辑）
      */
-    private void readSseStream(WatchListener listener, java.io.InputStream inputStream) throws java.io.IOException {
+    private void readSseStream(WatchListener listener, java.io.InputStream inputStream) throws Exception {
         try (BufferedReader reader = new BufferedReader(new InputStreamReader(inputStream))) {
             String line;
             StringBuilder eventData = new StringBuilder();
@@ -863,19 +929,51 @@ public class RaftKVClient {
     }
 
     /**
-     * 处理 Watch 事件
+     * 处理 Watch 事件。
+     * 控制类事件（init/heartbeat/error）若检测到连到非 Leader 节点，会抛异常触发外层重连。
      */
-    private void processWatchEvent(WatchListener listener, String eventType, String data) {
-        try {
-            if ("init".equals(eventType)) {
-                log.debug("Watch init event: {}", data);
-                return;
+    private void processWatchEvent(WatchListener listener, String eventType, String data) throws Exception {
+        if ("init".equals(eventType)) {
+            log.debug("Watch init event: {}", data);
+            Map<String, Object> init = objectMapper.readValue(data, Map.class);
+            Boolean isLeader = (Boolean) init.get("isLeader");
+            if (Boolean.FALSE.equals(isLeader)) {
+                String leaderUrl = (String) init.get("leaderUrl");
+                if (leaderUrl != null) updateLeader(leaderUrl);
+                throw new IOException("Watch server is not leader (init)");
             }
-            if ("heartbeat".equals(eventType)) {
-                log.debug("Watch heartbeat: {}", data);
-                return;
+            return;
+        }
+        if ("heartbeat".equals(eventType)) {
+            log.debug("Watch heartbeat: {}", data);
+            Map<String, Object> hb = objectMapper.readValue(data, Map.class);
+            Boolean isLeader = (Boolean) hb.get("isLeader");
+            if (Boolean.FALSE.equals(isLeader)) {
+                String leaderUrl = (String) hb.get("leaderUrl");
+                if (leaderUrl != null) updateLeader(leaderUrl);
+                throw new IOException("Watch server is not leader (heartbeat)");
             }
+            return;
+        }
+        if ("error".equals(eventType)) {
+            log.warn("Watch error event: {}", data);
+            Map<String, Object> err = objectMapper.readValue(data, Map.class);
+            String code = (String) err.get("code");
+            if ("NOT_LEADER".equals(code)) {
+                String leaderUrl = (String) err.get("leaderUrl");
+                if (leaderUrl != null) updateLeader(leaderUrl);
+                throw new IOException("Watch server returned NOT_LEADER");
+            }
+            if ("COMPACT_REVISION".equals(code)) {
+                Number oldestRevision = (Number) err.get("oldestRevision");
+                log.warn("Watch revision compacted, oldest available: {}. Will reconnect from latest.", oldestRevision);
+                listener.updateLastRevision(0); // 重置，下次从最新 revision 开始
+                throw new IOException("Watch revision compacted");
+            }
+            return;
+        }
 
+        try {
             WatchEvent event = objectMapper.readValue(data, WatchEvent.class);
             log.debug("Received watch event: type={}, key={}, revision={}",
                     event.getType(), event.getKey(), event.getRevision());

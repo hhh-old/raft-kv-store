@@ -98,10 +98,17 @@ public class RaftProperties {
      * 每隔多少秒触发一次快照
      * - 默认：3600（1小时）
      * - 建议值：3600 或 7200
-     * 
+     *
      * 与 snapshotLogIndexMargin 任一条件满足即触发快照
      */
     private int snapshotIntervalSecs = 3600;
+
+    /**
+     * Watch 历史事件缓冲区容量
+     * - 默认：10000
+     * - 生产环境建议：100000 ~ 1000000（根据内存和写入量评估）
+     */
+    private int watchHistoryCapacity = 10000;
 
     // === 以下字段由配置自动推导，不需要在配置文件中指定 ===
     

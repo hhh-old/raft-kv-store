@@ -3,6 +3,8 @@ package com.raftkv.service;
 import lombok.Data;
 import lombok.extern.slf4j.Slf4j;
 
+import org.springframework.stereotype.Component;
+
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentSkipListMap;
@@ -27,6 +29,7 @@ import java.util.concurrent.ConcurrentSkipListMap;
  * - 为 Revision 添加显式 equals/hashCode，确保与 compareTo 一致
  */
 @Slf4j
+@Component
 public class MVCCStore {
 
     /**
@@ -593,6 +596,13 @@ public class MVCCStore {
     }
 
     // ==================== 统计信息 ====================
+
+    /**
+     * 获取所有 key 的集合（包含 tombstone）
+     */
+    public Set<String> getAllKeys() {
+        return new HashSet<>(keyIndex.keySet());
+    }
 
     /**
      * 获取存储统计信息
