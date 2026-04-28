@@ -52,11 +52,26 @@ public class RaftKVService {
     @Autowired
     private MVCCStore mvccStore;
 
+    @Autowired
+    private LeaseManager leaseManager;
+
     private RaftGroupService raftGroupService;
     private Node node;
     private KVStoreStateMachine stateMachine;
     private final ObjectMapper objectMapper = new ObjectMapper();
     private volatile boolean initialized = false;
+
+    // Lease ID 生成器（从 1 开始递增）
+    private final java.util.concurrent.atomic.AtomicLong leaseIdGenerator = new java.util.concurrent.atomic.AtomicLong(0);
+
+    // Lease 过期检测定时器
+    private final java.util.concurrent.ScheduledExecutorService leaseExpirationExecutor =
+            java.util.concurrent.Executors.newSingleThreadScheduledExecutor(r -> {
+                Thread t = new Thread(r, "lease-expiration-worker");
+                t.setDaemon(true);
+                return t;
+            });
+    private volatile java.util.concurrent.ScheduledFuture<?> leaseExpirationFuture;
     
     // 存储所有节点的 raft endpoint -> http endpoint 映射
     // 用于 Leader 重定向时查找正确的 HTTP URL
@@ -202,7 +217,21 @@ public class RaftKVService {
 
         // 注入 WatchManager，用于生成 Watch 事件
         stateMachine.setWatchManager(watchManager);
-        
+
+        // 注入 LeaseManager，用于 Lease 状态管理
+        stateMachine.setLeaseManager(leaseManager);
+
+        // 注册 Leader 变更回调（启动/停止 Lease 过期检测）
+        stateMachine.setLeaderStartCallback(term -> {
+            LOG.info("Leader started, reloading leases and starting expiration worker");
+            leaseManager.reloadFromStore();
+            startLeaseExpirationWorker();
+        });
+        stateMachine.setLeaderStopCallback(() -> {
+            LOG.info("Leader stopped, stopping expiration worker");
+            stopLeaseExpirationWorker();
+        });
+
         // 将状态机绑定到 Raft 节点
         // 当 Raft 日志被大多数节点确认后（committed），就会调用 stateMachine.onApply() 应用该日志
         nodeOptions.setFsm(stateMachine);
@@ -425,24 +454,25 @@ public class RaftKVService {
 
     /**
      * 向 Raft 集群提交一个 PUT 操作（支持幂等）
-     * 
+     *
      * Raft 写流程：
      * 1. 检查当前节点是否是 Leader（只有 Leader 能处理写请求）
      * 2. 检查是否是重复请求（幂等去重，仅当提供了 requestId 时）
      * 3. 如果是 Leader，将操作封装为 Task 并提交到 Raft 日志
      * 4. 等待日志被大多数节点确认（committed）
      * 5. 日志被应用到状态机后，返回成功响应
-     * 
+     *
      * 幂等性说明：
      * - 如果提供了 requestId：启用幂等检查，重复请求返回缓存结果
      * - 如果没有提供 requestId：不启用幂等，每次请求都会执行
-     * 
+     *
      * @param key 键
      * @param value 值
      * @param requestId 客户端生成的请求 ID（重试时必须相同，用于幂等去重）。如果为 null 或空，则不启用幂等
+     * @param leaseId 绑定的租约 ID（null 表示不绑定）
      * @return 操作结果
      */
-    public KVResponse put(String key, String value, String requestId) {
+    public KVResponse put(String key, String value, String requestId, Long leaseId) {
         // 检查当前节点是否是 Leader
         // Raft 协议规定：只有 Leader 能处理客户端的写请求
         // 这是为了保证日志复制的顺序一致性
@@ -471,6 +501,9 @@ public class RaftKVService {
             // KVTask 包含了操作类型、key、value、时间戳等信息
             // 这个对象会被序列化后写入 Raft 日志
             KVTask task = KVTask.put(key, value, requestId);
+            if (leaseId != null && leaseId > 0) {
+                task.setLeaseId(leaseId);
+            }
 
             // 将 Task 序列化为字节数组
             byte[] data = objectMapper.writeValueAsBytes(task);
@@ -986,9 +1019,195 @@ public class RaftKVService {
         }
     }
 
+    // ==================== Lease 服务 ====================
+
+    /**
+     * 创建 Lease（走 Raft 日志，保证一致性）
+     *
+     * @param ttl 租约有效期（秒）
+     * @return LeaseGrantResponse
+     */
+    public LeaseGrantResponse leaseGrant(int ttl) {
+        if (!isLeader()) {
+            return LeaseGrantResponse.failure("NOT_LEADER");
+        }
+
+        if (ttl <= 0) {
+            ttl = 60; // 默认 60 秒
+        }
+
+        try {
+            long leaseId = leaseIdGenerator.incrementAndGet();
+            String requestId = UUID.randomUUID().toString();
+            KVTask task = KVTask.leaseGrant(leaseId, ttl, requestId);
+
+            byte[] data = objectMapper.writeValueAsBytes(task);
+            ByteBuffer dataBuffer = ByteBuffer.wrap(data);
+            CountDownLatch latch = new CountDownLatch(1);
+            AtomicReference<Status> statusRef = new AtomicReference<>();
+
+            Task raftTask = new Task(dataBuffer, new com.alipay.sofa.jraft.Closure() {
+                @Override
+                public void run(Status status) {
+                    statusRef.set(status);
+                    latch.countDown();
+                }
+            });
+
+            node.apply(raftTask);
+
+            boolean success = latch.await(raftProperties.getWriteTimeout(), TimeUnit.MILLISECONDS);
+            if (!success) {
+                return LeaseGrantResponse.failure("Lease grant timeout");
+            }
+
+            Status status = statusRef.get();
+            if (status != null && status.isOk()) {
+                LOG.info("Lease granted: id={}, ttl={}", leaseId, ttl);
+                return LeaseGrantResponse.success(leaseId, ttl);
+            } else {
+                return LeaseGrantResponse.failure(
+                        status != null ? status.getErrorMsg() : "Lease grant failed");
+            }
+        } catch (Exception e) {
+            LOG.error("Lease grant failed", e);
+            return LeaseGrantResponse.failure(e.getMessage());
+        }
+    }
+
+    /**
+     * 撤销 Lease（走 Raft 日志，保证一致性）
+     *
+     * @param leaseId 租约 ID
+     * @return true 如果成功
+     */
+    public boolean leaseRevoke(long leaseId) {
+        if (!isLeader()) {
+            return false;
+        }
+
+        try {
+            String requestId = UUID.randomUUID().toString();
+            KVTask task = KVTask.leaseRevoke(leaseId, requestId);
+
+            byte[] data = objectMapper.writeValueAsBytes(task);
+            ByteBuffer dataBuffer = ByteBuffer.wrap(data);
+            CountDownLatch latch = new CountDownLatch(1);
+            AtomicReference<Status> statusRef = new AtomicReference<>();
+
+            Task raftTask = new Task(dataBuffer, new com.alipay.sofa.jraft.Closure() {
+                @Override
+                public void run(Status status) {
+                    statusRef.set(status);
+                    latch.countDown();
+                }
+            });
+
+            node.apply(raftTask);
+
+            boolean success = latch.await(raftProperties.getWriteTimeout(), TimeUnit.MILLISECONDS);
+            if (!success) {
+                LOG.error("Lease revoke timeout: id={}", leaseId);
+                return false;
+            }
+
+            Status status = statusRef.get();
+            return status != null && status.isOk();
+        } catch (Exception e) {
+            LOG.error("Lease revoke failed: id={}", leaseId, e);
+            return false;
+        }
+    }
+
+    /**
+     * Lease KeepAlive（仅 Leader 内存更新，不走 Raft）
+     *
+     * @param leaseId 租约 ID
+     * @return true 如果租约存在并成功续约
+     */
+    public boolean leaseKeepAlive(long leaseId) {
+        if (!isLeader()) {
+            return false;
+        }
+        return leaseManager.keepAlive(leaseId);
+    }
+
+    /**
+     * 查询 Lease 剩余 TTL
+     *
+     * @param leaseId 租约 ID
+     * @return 剩余秒数，-1 表示不存在
+     */
+    public long leaseTtl(long leaseId) {
+        if (!isLeader()) {
+            return -1;
+        }
+        // 优先从内存 LeaseManager 查（热路径，已包含真实的剩余 TTL）
+        long ttl = leaseManager.getRemainingTtl(leaseId);
+        if (ttl >= 0) {
+            return ttl;
+        }
+        // 兜底：从 MVCCStore 查元数据（兼容 reloadFromStore 未完成或 lease 刚 grant 的场景）
+        // 使用 grantedTime 计算真实的剩余 TTL
+        MVCCStore.LeaseMeta meta = mvccStore.getLeaseMeta(leaseId);
+        if (meta != null) {
+            long now = System.currentTimeMillis();
+            long elapsed = now - meta.grantedTime;
+            long remaining = meta.ttl * 1000L - elapsed;
+            return Math.max(remaining / 1000, -1);
+        }
+        return -1;
+    }
+
+    /**
+     * 获取所有活跃 Lease ID
+     *
+     * @return Lease ID 列表
+     */
+    public List<Long> leaseLeases() {
+        if (!isLeader()) {
+            return null;
+        }
+        return leaseManager.getAllLeaseIds();
+    }
+
+    /**
+     * 启动 Lease 过期检测工作线程
+     */
+    private void startLeaseExpirationWorker() {
+        if (leaseExpirationFuture != null && !leaseExpirationFuture.isDone()) {
+            return; // 已在运行
+        }
+        leaseExpirationFuture = leaseExpirationExecutor.scheduleWithFixedDelay(() -> {
+            try {
+                List<Long> expired = leaseManager.getExpiredLeases();
+                for (Long leaseId : expired) {
+                    LOG.info("Lease expired, revoking: id={}", leaseId);
+                    leaseRevoke(leaseId);
+                }
+            } catch (Exception e) {
+                LOG.error("Lease expiration worker error", e);
+            }
+        }, 500, 500, TimeUnit.MILLISECONDS);
+        LOG.info("Lease expiration worker started");
+    }
+
+    /**
+     * 停止 Lease 过期检测工作线程
+     */
+    private void stopLeaseExpirationWorker() {
+        if (leaseExpirationFuture != null) {
+            leaseExpirationFuture.cancel(false);
+            leaseExpirationFuture = null;
+            LOG.info("Lease expiration worker stopped");
+        }
+    }
+
     @PreDestroy
     public void shutdown() {
         LOG.info("Shutting down Raft node...");
+        stopLeaseExpirationWorker();
+        leaseExpirationExecutor.shutdown();
         if (raftGroupService != null) {
             raftGroupService.shutdown();
         }

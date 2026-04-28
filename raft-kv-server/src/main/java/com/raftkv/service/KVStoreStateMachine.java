@@ -120,6 +120,13 @@ public class KVStoreStateMachine extends StateMachineAdapter {
     // Watch 管理器（由外部注入）
     private volatile WatchManager watchManager;
 
+    // Lease 管理器（由外部注入）
+    private volatile LeaseManager leaseManager;
+
+    // Leader 变更回调（由外部注入）
+    private volatile java.util.function.Consumer<Long> leaderStartCallback;
+    private volatile Runnable leaderStopCallback;
+
     public KVStoreStateMachine() {
         // 数据目录由 Raft 管理，状态机不再需要自己管理文件
         // 所有持久化工作交给 Raft 的 Snapshot 机制
@@ -433,7 +440,12 @@ public class KVStoreStateMachine extends StateMachineAdapter {
         switch (task.getOp()) {
             case KVTask.OP_PUT:
                 // 使用 MVCCStore 的细粒度锁（per-key lock）
-                applyPutMVCC(task.getKey(), task.getValue());
+                Long putLeaseId = task.getLeaseId();
+                if (putLeaseId != null && putLeaseId > 0) {
+                    applyPutMVCC(task.getKey(), task.getValue(), putLeaseId);
+                } else {
+                    applyPutMVCC(task.getKey(), task.getValue());
+                }
                 break;
             case KVTask.OP_DELETE:
                 // 使用 MVCCStore 的细粒度锁
@@ -450,6 +462,14 @@ public class KVStoreStateMachine extends StateMachineAdapter {
                 } else {
                     LOG.warn("TXN operation without txnRequest");
                 }
+                break;
+            case KVTask.OP_LEASE_GRANT:
+                // Lease 授予操作
+                applyLeaseGrant(task);
+                break;
+            case KVTask.OP_LEASE_REVOKE:
+                // Lease 撤销操作
+                applyLeaseRevoke(task.getLeaseId());
                 break;
             default:
                 LOG.warn("Unknown operation: {}", task.getOp());
@@ -478,13 +498,24 @@ public class KVStoreStateMachine extends StateMachineAdapter {
      * 应用 PUT 操作 - 使用 MVCCStore 细粒度锁
      */
     private void applyPutMVCC(String key, String value) {
+        applyPutMVCC(key, value, 0L);
+    }
+
+    /**
+     * 应用 PUT 操作（带 Lease 绑定）
+     */
+    private void applyPutMVCC(String key, String value, long leaseId) {
         // MVCCStore.put() 内部会生成 revision 并更新版本信息
-        mvccStore.put(key, value);
-        
+        if (leaseId > 0) {
+            mvccStore.put(key, value, leaseId);
+        } else {
+            mvccStore.put(key, value);
+        }
+
         // 从 MVCCStore 获取刚生成的 revision
         MVCCStore.Revision modRev = mvccStore.getModRevision(key);
         long modRevValue = (modRev != null) ? modRev.getMainRev() : 0;
-        
+
         // 触发 Watch 通知（使用带 try-catch 的 publishWatchEvent，防止 Watch 异常影响 onApply）
         if (watchManager != null) {
             // 直接从 MVCCStore 获取 KeyVersion
@@ -494,6 +525,79 @@ public class KVStoreStateMachine extends StateMachineAdapter {
             WatchEvent event = WatchEvent.put(key, value, modRevValue, createRev, version);
             publishWatchEvent(event);
         }
+    }
+
+    /**
+     * 应用 Lease Grant 操作
+     * 使用 KVTask 中的 grantedTime（Leader 创建日志时记录的时间），确保所有节点重放时使用相同的时间戳
+     */
+    private void applyLeaseGrant(KVTask task) {
+        if (task.getLeaseId() <= 0 || task.getLeaseTtl() <= 0) {
+            LOG.warn("Invalid lease grant: id={}, ttl={}", task.getLeaseId(), task.getLeaseTtl());
+            return;
+        }
+        // 使用 Raft 日志中的授予时间，而非当前时间
+        long grantedTime = task.getGrantedTime() != null ? task.getGrantedTime() : System.currentTimeMillis();
+        LOG.info("applyLeaseGrant: id={}, ttl={}, grantedTime={}, mvccStore.leases before={}",
+                task.getLeaseId(), task.getLeaseTtl(), grantedTime, mvccStore.getAllLeaseMetas().size());
+        mvccStore.grantLease(task.getLeaseId(), task.getLeaseTtl(), grantedTime);
+        if (leaseManager != null) {
+            leaseManager.onLeaseGranted(task.getLeaseId(), task.getLeaseTtl(), grantedTime);
+        }
+        LOG.info("applyLeaseGrant completed: id={}, mvccStore.leases after={}",
+                task.getLeaseId(), mvccStore.getAllLeaseMetas().size());
+    }
+
+    /**
+     * 应用 Lease Revoke 操作 - 删除该 lease 绑定的所有 keys
+     */
+    private void applyLeaseRevoke(long leaseId) {
+        if (leaseId <= 0) {
+            LOG.warn("Invalid lease revoke: id={}", leaseId);
+            return;
+        }
+
+        // 获取该 lease 绑定的所有 keys
+        java.util.Set<String> keys = mvccStore.getLeaseKeys(leaseId);
+
+        // 先通知 LeaseManager
+        if (leaseManager != null) {
+            leaseManager.onLeaseRevoked(leaseId);
+        }
+
+        // 删除所有关联的 keys（生成 tombstone，触发 Watch）
+        for (String key : keys) {
+            // 检查 key 是否仍有效（跳过已删除的）
+            MVCCStore.KeyValue latest = mvccStore.getLatest(key);
+            if (latest == null) {
+                continue;
+            }
+
+            // 获取删除前的版本信息
+            MVCCStore.KeyVersion keyVersion = mvccStore.getKeyVersion(key);
+            long createRevBefore = (keyVersion != null) ? keyVersion.createRevision : 0;
+            long versionBefore = (keyVersion != null) ? keyVersion.version : 0;
+
+            // 生成新的 revision 用于删除
+            MVCCStore.Revision delRev = mvccStore.generateRevision();
+
+            // 执行删除（创建 tombstone）
+            mvccStore.deleteWithRevision(key, delRev);
+
+            // 解绑 key 与 lease 的关系
+            mvccStore.unbindKeyFromLease(key);
+
+            // 触发 Watch 通知
+            if (watchManager != null) {
+                WatchEvent event = WatchEvent.delete(key, delRev.getMainRev(), createRevBefore, versionBefore + 1);
+                publishWatchEvent(event);
+            }
+        }
+
+        // 清理 lease 元数据
+        mvccStore.revokeLease(leaseId);
+
+        LOG.info("Lease revoked: id={}, removed {} keys", leaseId, keys.size());
     }
     
     /**
@@ -541,12 +645,36 @@ public class KVStoreStateMachine extends StateMachineAdapter {
 
     /**
      * 设置 WatchManager（由 RaftKVService 注入）
-     * 
+     *
      * @param watchManager Watch 管理器
      */
     public void setWatchManager(WatchManager watchManager) {
         this.watchManager = watchManager;
         LOG.info("WatchManager injected into state machine");
+    }
+
+    /**
+     * 设置 LeaseManager（由 RaftKVService 注入）
+     *
+     * @param leaseManager Lease 管理器
+     */
+    public void setLeaseManager(LeaseManager leaseManager) {
+        this.leaseManager = leaseManager;
+        LOG.info("LeaseManager injected into state machine");
+    }
+
+    /**
+     * 设置 Leader 开始回调
+     */
+    public void setLeaderStartCallback(java.util.function.Consumer<Long> callback) {
+        this.leaderStartCallback = callback;
+    }
+
+    /**
+     * 设置 Leader 停止回调
+     */
+    public void setLeaderStopCallback(Runnable callback) {
+        this.leaderStopCallback = callback;
     }
 
     /**
@@ -602,6 +730,17 @@ public class KVStoreStateMachine extends StateMachineAdapter {
                 LOG.error("Failed to prefill EventHistory on leader start: {}", e.getMessage(), e);
             }
         }
+
+        // 触发 Leader 开始回调（通知 RaftKVService 启动 Lease 过期检测）
+        if (leaderStartCallback != null) {
+            try {
+                LOG.info("onLeaderStart: invoking leaderStartCallback, mvccStore.leases={}",
+                        mvccStore.getAllLeaseMetas().size());
+                leaderStartCallback.accept(term);
+            } catch (Exception e) {
+                LOG.error("Leader start callback failed: {}", e.getMessage(), e);
+            }
+        }
     }
 
     /**
@@ -621,6 +760,15 @@ public class KVStoreStateMachine extends StateMachineAdapter {
     public void onLeaderStop(Status status) {
         LOG.info("onLeaderStop: status={}", status);
         this.leaderTerm.set(-1);
+
+        // 触发 Leader 停止回调（通知 RaftKVService 停止 Lease 过期检测）
+        if (leaderStopCallback != null) {
+            try {
+                leaderStopCallback.run();
+            } catch (Exception e) {
+                LOG.error("Leader stop callback failed: {}", e.getMessage(), e);
+            }
+        }
     }
 
     /**
@@ -965,11 +1113,27 @@ public class KVStoreStateMachine extends StateMachineAdapter {
                                                   java.util.Map<String, MVCCStore.KeyVersion> txnVersionContext,
                                                   long mainRev,
                                                   int subRev) {
+        return executePutInTxn(key, value, txnContext, txnVersionContext, mainRev, subRev, null);
+    }
+
+    /**
+     * 在事务中执行 PUT 操作（支持事务上下文和 Lease 绑定）
+     */
+    private TxnResponse.OpResult executePutInTxn(String key, String value,
+                                                  java.util.Map<String, String> txnContext,
+                                                  java.util.Map<String, MVCCStore.KeyVersion> txnVersionContext,
+                                                  long mainRev,
+                                                  int subRev,
+                                                  Long leaseId) {
         // etcd 事务语义：所有操作共享同一个 mainRev，通过 subRev 区分顺序
         MVCCStore.Revision txnRev = new MVCCStore.Revision(mainRev, subRev);
 
         // 使用指定的 revision 写入（不生成新的 revision）
-        mvccStore.putWithRevision(key, value, txnRev);
+        if (leaseId != null && leaseId > 0) {
+            mvccStore.putWithLease(key, value, txnRev, leaseId);
+        } else {
+            mvccStore.putWithRevision(key, value, txnRev);
+        }
 
         // 获取 Key 的版本信息（从 MVCCStore 获取）
         MVCCStore.KeyVersion keyVersion = mvccStore.getKeyVersion(key);
@@ -1087,7 +1251,7 @@ public class KVStoreStateMachine extends StateMachineAdapter {
 
         switch (op.getType()) {
             case PUT:
-                return executePutInTxn(key, op.getValue(), txnContext, txnVersionContext, mainRev, subRev);
+                return executePutInTxn(key, op.getValue(), txnContext, txnVersionContext, mainRev, subRev, op.getLeaseId());
             case DELETE:
                 return executeDeleteInTxn(key, txnContext, txnVersionContext, mainRev, subRev);
             case GET:

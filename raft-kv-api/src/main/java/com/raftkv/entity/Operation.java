@@ -39,6 +39,11 @@ public class Operation implements Serializable {
     private String value;
 
     /**
+     * 绑定的租约 ID（PUT 时使用，0 或 null 表示不绑定租约）
+     */
+    private Long leaseId;
+
+    /**
      * 操作类型
      */
     public enum OpType {
@@ -68,6 +73,18 @@ public class Operation implements Serializable {
                 .type(OpType.PUT)
                 .key(key)
                 .value(value)
+                .build();
+    }
+
+    /**
+     * 创建带租约的 PUT 操作
+     */
+    public static Operation put(String key, String value, long leaseId) {
+        return Operation.builder()
+                .type(OpType.PUT)
+                .key(key)
+                .value(value)
+                .leaseId(leaseId)
                 .build();
     }
 

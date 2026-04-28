@@ -12,8 +12,10 @@ import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.time.Duration;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
@@ -174,19 +176,35 @@ public class RaftKVClient {
 
     /**
      * PUT 操作（指定 requestId，支持幂等）
-     * 
+     *
      * @param key 键
      * @param value 值
      * @param requestId 请求 ID（重试时必须相同）
      * @return 响应
      */
     public KVResponse put(String key, String value, String requestId) {
-        log.debug("PUT request: key={}, value={}, requestId={}", key, value, requestId);
+        return put(key, value, requestId, null);
+    }
+
+    /**
+     * PUT 操作（带 Lease 绑定）
+     *
+     * @param key 键
+     * @param value 值
+     * @param requestId 请求 ID
+     * @param leaseId 租约 ID
+     * @return 响应
+     */
+    public KVResponse put(String key, String value, String requestId, Long leaseId) {
+        log.debug("PUT request: key={}, value={}, requestId={}, leaseId={}", key, value, requestId, leaseId);
 
         Map<String, Object> body = new HashMap<>();
         body.put("key", key);  // 将 key 放入 body，支持带斜杠的 key
         body.put("value", value);
         body.put("requestId", requestId);
+        if (leaseId != null) {
+            body.put("leaseId", leaseId);
+        }
 
         return executeWithRetry("PUT", () -> {
             String url = getCurrentLeader() + "/kv";
@@ -1051,6 +1069,249 @@ public class RaftKVClient {
         }
         // 不立即 clear，由各个 runWatchLoop 检测到 cancelled 后自行移除
         log.info("All watches marked for closing");
+    }
+
+    // ==================== Lease 支持 ====================
+
+    /**
+     * 创建 Lease
+     *
+     * @param ttl 租约有效期（秒）
+     * @return LeaseGrantResponse
+     */
+    public LeaseGrantResponse leaseGrant(int ttl) {
+        log.debug("Lease grant request: ttl={}", ttl);
+        Map<String, Object> body = new HashMap<>();
+        body.put("ttl", ttl);
+
+        return executeLeaseWithRetry("LEASE_GRANT", "/lease/grant", body, LeaseGrantResponse.class);
+    }
+
+    /**
+     * 撤销 Lease
+     *
+     * @param leaseId 租约 ID
+     * @return true 如果成功
+     */
+    public boolean leaseRevoke(long leaseId) {
+        log.debug("Lease revoke request: id={}", leaseId);
+        Map<String, Object> body = new HashMap<>();
+        body.put("id", leaseId);
+
+        try {
+            Map<String, Object> result = executeLeaseRequest("LEASE_REVOKE", "/lease/revoke", "POST", body);
+            return Boolean.TRUE.equals(result.get("success"));
+        } catch (Exception e) {
+            log.error("Lease revoke failed", e);
+        }
+        return false;
+    }
+
+    /**
+     * Lease KeepAlive（续约）
+     *
+     * @param leaseId 租约 ID
+     * @return true 如果成功
+     */
+    public boolean leaseKeepAlive(long leaseId) {
+        log.debug("Lease keepalive request: id={}", leaseId);
+        Map<String, Object> body = new HashMap<>();
+        body.put("id", leaseId);
+
+        try {
+            Map<String, Object> result = executeLeaseRequest("LEASE_KEEPALIVE", "/lease/keepalive", "POST", body);
+            return Boolean.TRUE.equals(result.get("success"));
+        } catch (Exception e) {
+            log.error("Lease keepalive failed", e);
+        }
+        return false;
+    }
+
+    /**
+     * 查询 Lease 剩余 TTL
+     *
+     * @param leaseId 租约 ID
+     * @return 剩余秒数，-1 表示不存在
+     */
+    public long leaseTtl(long leaseId) {
+        log.debug("Lease TTL request: id={}", leaseId);
+        try {
+            Map<String, Object> result = executeLeaseRequest("LEASE_TTL", "/lease/ttl?id=" + leaseId, "GET", null);
+            Number ttl = (Number) result.get("ttl");
+            return ttl != null ? ttl.longValue() : -1;
+        } catch (Exception e) {
+            log.error("Lease TTL query failed", e);
+        }
+        return -1;
+    }
+
+    /**
+     * 获取所有活跃 Lease ID
+     *
+     * @return Lease ID 列表
+     */
+    public List<Long> leaseLeases() {
+        log.debug("Lease leases request");
+        try {
+            Map<String, Object> result = executeLeaseRequest("LEASE_LIST", "/lease/leases", "GET", null);
+            List<Number> leases = (List<Number>) result.get("leases");
+            if (leases != null) {
+                return leases.stream().map(Number::longValue).collect(Collectors.toList());
+            }
+        } catch (Exception e) {
+            log.error("Lease leases query failed", e);
+        }
+        return new ArrayList<>();
+    }
+
+    /**
+     * Lease 通用 HTTP 请求执行（支持 GET/POST，含故障转移与重试）
+     *
+     * @param operation 操作名称（用于日志）
+     * @param endpoint  REST 端点路径（如 /lease/ttl）
+     * @param method    HTTP 方法（"GET" 或 "POST"）
+     * @param body      POST 请求体，GET 请求传 null
+     * @return 服务端返回的 JSON 解析后的 Map
+     */
+    private Map<String, Object> executeLeaseRequest(String operation, String endpoint, String method, Map<String, Object> body) {
+        Exception lastException = null;
+        java.util.Set<String> triedEndpoints = new java.util.HashSet<>();
+
+        for (int attempt = 1; attempt <= maxRetries; attempt++) {
+            try {
+                String url = getCurrentLeader() + endpoint;
+                log.debug("{} attempt {} using endpoint: {}", operation, attempt, url);
+
+                HttpRequest.Builder requestBuilder = HttpRequest.newBuilder()
+                        .uri(URI.create(url))
+                        .timeout(Duration.ofSeconds(timeoutSeconds));
+
+                if ("POST".equalsIgnoreCase(method)) {
+                    String jsonBody = objectMapper.writeValueAsString(body);
+                    requestBuilder
+                            .header("Content-Type", "application/json")
+                            .POST(HttpRequest.BodyPublishers.ofString(jsonBody));
+                } else {
+                    requestBuilder.GET();
+                }
+
+                HttpResponse<String> response = httpClient.send(requestBuilder.build(), HttpResponse.BodyHandlers.ofString());
+
+                if (response.statusCode() == 301) {
+                    String location = response.headers().firstValue("Location").orElse(null);
+                    if (location != null) {
+                        updateLeader(location.replace(endpoint, ""));
+                    }
+                    continue;
+                }
+
+                if (response.statusCode() == 200) {
+                    markEndpointHealthy(getCurrentLeader());
+                    return objectMapper.readValue(response.body(), Map.class);
+                } else {
+                    throw new RuntimeException(operation + " failed: HTTP " + response.statusCode());
+                }
+            } catch (Exception e) {
+                lastException = e;
+                String currentEndpoint = getCurrentLeader();
+                log.warn("{} attempt {} failed on {}: {}", operation, attempt, currentEndpoint, e.getMessage());
+
+                // 连接失败时切换到其他可用端点
+                if (isConnectionFailure(e)) {
+                    markEndpointUnhealthy(currentEndpoint);
+                    triedEndpoints.add(currentEndpoint);
+                    String available = findAvailableEndpoint(triedEndpoints);
+                    if (available != null) {
+                        log.info("Connection failure, switching to available endpoint: {}", available);
+                        updateLeader(available);
+                        continue;
+                    }
+                }
+
+                if (attempt < maxRetries) {
+                    if (attempt == 1 && e instanceof java.net.http.HttpTimeoutException) {
+                        continue;
+                    }
+                    long waitTime = calculateBackoff(attempt);
+                    try {
+                        Thread.sleep(waitTime);
+                    } catch (InterruptedException ie) {
+                        Thread.currentThread().interrupt();
+                        throw new RuntimeException("Retry interrupted", ie);
+                    }
+                }
+            }
+        }
+        throw new RuntimeException(operation + " failed after " + maxRetries + " attempts", lastException);
+    }
+
+    /**
+     * Lease 操作的通用重试执行（兼容旧版 POST 调用）
+     */
+    private <T> T executeLeaseWithRetry(String operation, String endpoint, Map<String, Object> body, Class<T> responseType) {
+        Exception lastException = null;
+        java.util.Set<String> triedEndpoints = new java.util.HashSet<>();
+
+        for (int attempt = 1; attempt <= maxRetries; attempt++) {
+            try {
+                String jsonBody = objectMapper.writeValueAsString(body);
+                String url = getCurrentLeader() + endpoint;
+                log.debug("{} attempt {} using endpoint: {}", operation, attempt, url);
+
+                HttpRequest request = HttpRequest.newBuilder()
+                        .uri(URI.create(url))
+                        .timeout(Duration.ofSeconds(timeoutSeconds))
+                        .header("Content-Type", "application/json")
+                        .POST(HttpRequest.BodyPublishers.ofString(jsonBody))
+                        .build();
+                HttpResponse<String> response = httpClient.send(request, HttpResponse.BodyHandlers.ofString());
+
+                if (response.statusCode() == 301) {
+                    String location = response.headers().firstValue("Location").orElse(null);
+                    if (location != null) {
+                        updateLeader(location.replace(endpoint, ""));
+                    }
+                    continue;
+                }
+
+                if (response.statusCode() == 200) {
+                    markEndpointHealthy(getCurrentLeader());
+                    return objectMapper.readValue(response.body(), responseType);
+                } else {
+                    throw new RuntimeException(operation + " failed: HTTP " + response.statusCode());
+                }
+            } catch (Exception e) {
+                lastException = e;
+                String currentEndpoint = getCurrentLeader();
+                log.warn("{} attempt {} failed on {}: {}", operation, attempt, currentEndpoint, e.getMessage());
+
+                // 连接失败时切换到其他可用端点
+                if (isConnectionFailure(e)) {
+                    markEndpointUnhealthy(currentEndpoint);
+                    triedEndpoints.add(currentEndpoint);
+                    String available = findAvailableEndpoint(triedEndpoints);
+                    if (available != null) {
+                        log.info("Connection failure, switching to available endpoint: {}", available);
+                        updateLeader(available);
+                        continue;
+                    }
+                }
+
+                if (attempt < maxRetries) {
+                    if (attempt == 1 && e instanceof java.net.http.HttpTimeoutException) {
+                        continue;
+                    }
+                    long waitTime = calculateBackoff(attempt);
+                    try {
+                        Thread.sleep(waitTime);
+                    } catch (InterruptedException ie) {
+                        Thread.currentThread().interrupt();
+                        throw new RuntimeException("Retry interrupted", ie);
+                    }
+                }
+            }
+        }
+        throw new RuntimeException(operation + " failed after " + maxRetries + " attempts", lastException);
     }
 
     // ==================== 事务支持 ====================

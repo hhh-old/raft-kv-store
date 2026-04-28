@@ -45,6 +45,24 @@ public class KVTask implements Serializable {
     public static final String OP_PUT = "PUT";
     public static final String OP_DELETE = "DELETE";
     public static final String OP_TXN = "TXN";
+    public static final String OP_LEASE_GRANT = "LEASE_GRANT";
+    public static final String OP_LEASE_REVOKE = "LEASE_REVOKE";
+
+    /**
+     * 租约 ID（ Lease 相关操作使用）
+     */
+    private Long leaseId;
+
+    /**
+     * 租约 TTL（Lease Grant 时使用，单位：秒）
+     */
+    private Integer leaseTtl;
+
+    /**
+     * 租约授予时间（毫秒时间戳，Leader 创建日志时记录）
+     * 用于 Leader 切换后新 Leader 正确计算剩余 TTL
+     */
+    private Long grantedTime;
 
     /**
      * 事务请求（当 op 为 TXN 时使用）
@@ -93,6 +111,45 @@ public class KVTask implements Serializable {
         task.setTimestamp(System.currentTimeMillis());
         task.setRequestId(requestId);
         task.setTxnRequest(txnRequest);
+        return task;
+    }
+
+    /**
+     * 创建 Lease Grant 任务
+     *
+     * @param leaseId 租约 ID
+     * @param ttl 租约有效期（秒）
+     * @param requestId 请求 ID
+     * @return KVTask
+     */
+    public static KVTask leaseGrant(long leaseId, int ttl, String requestId) {
+        KVTask task = new KVTask();
+        task.setOp(OP_LEASE_GRANT);
+        task.setKey("");
+        task.setValue(null);
+        task.setLeaseId(leaseId);
+        task.setLeaseTtl(ttl);
+        task.setGrantedTime(System.currentTimeMillis());  // 记录授予时间，用于 Leader 切换后正确计算 TTL
+        task.setTimestamp(System.currentTimeMillis());
+        task.setRequestId(requestId);
+        return task;
+    }
+
+    /**
+     * 创建 Lease Revoke 任务
+     *
+     * @param leaseId 租约 ID
+     * @param requestId 请求 ID
+     * @return KVTask
+     */
+    public static KVTask leaseRevoke(long leaseId, String requestId) {
+        KVTask task = new KVTask();
+        task.setOp(OP_LEASE_REVOKE);
+        task.setKey("");
+        task.setValue(null);
+        task.setLeaseId(leaseId);
+        task.setTimestamp(System.currentTimeMillis());
+        task.setRequestId(requestId);
         return task;
     }
 }

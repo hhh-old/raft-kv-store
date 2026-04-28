@@ -80,8 +80,12 @@ public class KVController {
         // 客户端可以提供 requestId（用于幂等）
         String requestId = (String) body.get("requestId");
 
-        log.info("PUT request: key={}, value={}, requestId={}", actualKey, value, requestId);
-        KVResponse response = raftKVService.put(actualKey, value, requestId);
+        // 客户端可以提供 leaseId 绑定租约
+        Number leaseIdNum = (Number) body.get("leaseId");
+        Long leaseId = leaseIdNum != null ? leaseIdNum.longValue() : null;
+
+        log.info("PUT request: key={}, value={}, requestId={}, leaseId={}", actualKey, value, requestId, leaseId);
+        KVResponse response = raftKVService.put(actualKey, value, requestId, leaseId);
 
         // 检查是否需要重定向
         ResponseEntity<KVResponse> redirectResponse = redirectIfNotLeader(response, "/kv/" + actualKey);

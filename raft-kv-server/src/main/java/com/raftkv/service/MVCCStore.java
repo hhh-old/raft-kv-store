@@ -153,10 +153,23 @@ public class MVCCStore {
     // 相比从 history.lastEntry() 派生，避免了 ConcurrentSkipListMap 读写竞争导致的 version 丢失
     private final Map<String, Long> keyVersions;
 
+    // ==================== Lease 相关字段 ====================
+    // leaseId -> Lease 元数据（持久化到快照）
+    private final Map<Long, LeaseMeta> leaseMetas;
+
+    // key -> leaseId 映射（持久化到快照）
+    private final Map<String, Long> keyToLease;
+
+    // leaseId -> 绑定的 keys 集合（持久化到快照）
+    private final Map<Long, Set<String>> leaseToKeys;
+
     public MVCCStore() {
         this.keyIndex = new ConcurrentHashMap<>();
         this.currentRevision = 0;
         this.keyVersions = new ConcurrentHashMap<>();
+        this.leaseMetas = new ConcurrentHashMap<>();
+        this.keyToLease = new ConcurrentHashMap<>();
+        this.leaseToKeys = new ConcurrentHashMap<>();
     }
 
     // ==================== 基本操作 ====================
@@ -218,12 +231,24 @@ public class MVCCStore {
     }
 
     /**
-     * 简化版 put
+     * 简化版 put（不带 lease）
      */
     public void put(String key, String value) {
         // 生成新的 revision
         Revision rev = generateRevision();
         putWithRevision(key, value, rev);
+    }
+
+    /**
+     * 带 Lease 的 put
+     *
+     * @param key 键
+     * @param value 值
+     * @param leaseId 租约 ID（0 表示不绑定）
+     */
+    public void put(String key, String value, long leaseId) {
+        Revision rev = generateRevision();
+        putWithLease(key, value, rev, leaseId);
     }
 
     /**
@@ -278,6 +303,120 @@ public class MVCCStore {
         // 存储新版本
         KeyValue storedKv = KeyValue.create(key, value, rev, createRev, newVersion);
         history.put(rev, storedKv);
+    }
+
+    /**
+     * 使用指定的 revision 写入数据并绑定 Lease
+     *
+     * @param key 键
+     * @param value 值
+     * @param rev 指定的 revision
+     * @param leaseId 租约 ID（0 表示不绑定）
+     */
+    public void putWithLease(String key, String value, Revision rev, long leaseId) {
+        // 先执行普通 put
+        putWithRevision(key, value, rev);
+
+        // 处理 lease 绑定
+        if (leaseId > 0) {
+            // 解绑旧的 lease
+            unbindKeyFromLease(key);
+
+            // 绑定新的 lease
+            keyToLease.put(key, leaseId);
+            leaseToKeys.computeIfAbsent(leaseId, k -> ConcurrentHashMap.newKeySet()).add(key);
+        }
+
+    }
+
+    /**
+     * 解绑 key 与其 lease 的关系
+     */
+    public void unbindKeyFromLease(String key) {
+        Long oldLeaseId = keyToLease.remove(key);
+        if (oldLeaseId != null) {
+            Set<String> keys = leaseToKeys.get(oldLeaseId);
+            if (keys != null) {
+                keys.remove(key);
+                if (keys.isEmpty()) {
+                    leaseToKeys.remove(oldLeaseId);
+                }
+            }
+        }
+    }
+
+    // ==================== Lease 管理 ====================
+
+    /**
+     * Lease 元数据
+     */
+    public static class LeaseMeta {
+        public final long id;
+        public final int ttl; // 秒
+        public final long grantedTime; // 授予时间（毫秒时间戳），用于 Leader 切换后计算剩余 TTL
+
+        public LeaseMeta(long id, int ttl, long grantedTime) {
+            this.id = id;
+            this.ttl = ttl;
+            this.grantedTime = grantedTime;
+        }
+    }
+
+    /**
+     * 创建 Lease 元数据
+     *
+     * @param leaseId 租约 ID
+     * @param ttl 租约有效期（秒）
+     * @param grantedTime 授予时间（毫秒时间戳，从 Raft 日志中获取）
+     */
+    public void grantLease(long leaseId, int ttl, long grantedTime) {
+        leaseMetas.put(leaseId, new LeaseMeta(leaseId, ttl, grantedTime));
+    }
+
+    /**
+     * 撤销 Lease，返回该 lease 绑定的所有 keys
+     */
+    public Set<String> revokeLease(long leaseId) {
+        // 移除 lease 元数据
+        leaseMetas.remove(leaseId);
+
+        // 获取并移除绑定的 keys
+        Set<String> keys = leaseToKeys.remove(leaseId);
+        if (keys != null) {
+            for (String key : keys) {
+                keyToLease.remove(key);
+            }
+        }
+        return keys != null ? keys : java.util.Collections.emptySet();
+    }
+
+    /**
+     * 获取 Lease 元数据
+     */
+    public LeaseMeta getLeaseMeta(long leaseId) {
+        return leaseMetas.get(leaseId);
+    }
+
+    /**
+     * 获取所有 Lease 元数据
+     */
+    public java.util.Collection<LeaseMeta> getAllLeaseMetas() {
+        return leaseMetas.values();
+    }
+
+    /**
+     * 获取 Lease 绑定的所有 keys
+     */
+    public Set<String> getLeaseKeys(long leaseId) {
+        Set<String> keys = leaseToKeys.get(leaseId);
+        return keys != null ? new java.util.HashSet<>(keys) : java.util.Collections.emptySet();
+    }
+
+    /**
+     * 获取 key 绑定的 leaseId
+     */
+    public Long getKeyLeaseId(String key) {
+        return keyToLease.get(key);
     }
 
     /**
@@ -673,8 +812,18 @@ public class MVCCStore {
         // 3. 保存 currentRevision
         snapshot.put("currentRevision", currentRevision);
 
-        // 不再需要保存 keyCreateRevisions！
-        // createRevision 已包含在每个 KeyValue 中，可从 keyIndex 派生
+        // 4. 保存 Lease 元数据
+        snapshot.put("leaseMetas", new HashMap<>(leaseMetas));
+
+        // 5. 保存 key -> leaseId 映射
+        snapshot.put("keyToLease", new HashMap<>(keyToLease));
+
+        // 6. 保存 leaseId -> keys 映射
+        Map<Long, List<String>> leaseKeysSnapshot = new HashMap<>();
+        for (Map.Entry<Long, Set<String>> entry : leaseToKeys.entrySet()) {
+            leaseKeysSnapshot.put(entry.getKey(), new ArrayList<>(entry.getValue()));
+        }
+        snapshot.put("leaseToKeys", leaseKeysSnapshot);
 
         return snapshot;
     }
@@ -693,17 +842,22 @@ public class MVCCStore {
         // 1. 清空当前数据
         keyIndex.clear();
         keyVersions.clear();
+        leaseMetas.clear();
+        keyToLease.clear();
+        leaseToKeys.clear();
 
-        // 2. 恢复 currentRevision
-        Long loadedRevision = (Long) snapshot.get("currentRevision");
-        if (loadedRevision != null) {
-            this.currentRevision = loadedRevision;
+        // 2. 恢复 currentRevision（兼容 Number 类型）
+        Object revisionObj = snapshot.get("currentRevision");
+        if (revisionObj != null) {
+            this.currentRevision = ((Number) revisionObj).longValue();
         }
 
-        // 3. 恢复 keyVersions
-        Map<String, Long> versions = (Map<String, Long>) snapshot.get("keyVersions");
+        // 3. 恢复 keyVersions（兼容 JSON 反序列化后的 Integer）
+        Map<String, Object> versions = (Map<String, Object>) snapshot.get("keyVersions");
         if (versions != null) {
-            keyVersions.putAll(versions);
+            for (Map.Entry<String, Object> entry : versions.entrySet()) {
+                keyVersions.put(entry.getKey(), ((Number) entry.getValue()).longValue());
+            }
         }
 
         // 4. 恢复所有 key 的历史版本（重建 keyIndex）
@@ -733,8 +887,58 @@ public class MVCCStore {
             }
         }
 
-        // 不再需要恢复 keyCreateRevisions！
-        // createRevision 已包含在 keyIndex 的每个 KeyValue 中
+        // 5. 恢复 Lease 元数据（兼容直接调用和 JSON 反序列化两种场景）
+        // 注意：快照恢复时 grantedTime 可能缺失，尝试从快照读取，否则使用当前时间
+        Map<String, Object> loadedLeaseMetas = (Map<String, Object>) snapshot.get("leaseMetas");
+        if (loadedLeaseMetas != null) {
+            for (Map.Entry<String, Object> entry : loadedLeaseMetas.entrySet()) {
+                long leaseId = Long.parseLong(entry.getKey());
+                Object metaObj = entry.getValue();
+                int ttl;
+                long grantedTime = System.currentTimeMillis(); // 默认为当前时间
+                if (metaObj instanceof LeaseMeta) {
+                    ttl = ((LeaseMeta) metaObj).ttl;
+                    // 如果快照中有 grantedTime，使用它
+                    grantedTime = ((LeaseMeta) metaObj).grantedTime;
+                } else {
+                    Map<String, Object> metaMap = (Map<String, Object>) metaObj;
+                    ttl = ((Number) metaMap.get("ttl")).intValue();
+                    // 尝试从快照恢复 grantedTime（新增字段，兼容旧快照）
+                    Object grantedTimeObj = metaMap.get("grantedTime");
+                    if (grantedTimeObj != null) {
+                        grantedTime = ((Number) grantedTimeObj).longValue();
+                    }
+                }
+                leaseMetas.put(leaseId, new LeaseMeta(leaseId, ttl, grantedTime));
+            }
+        }
+
+        // 6. 恢复 key -> leaseId 映射
+        Map<String, Object> loadedKeyToLease = (Map<String, Object>) snapshot.get("keyToLease");
+        if (loadedKeyToLease != null) {
+            for (Map.Entry<String, Object> entry : loadedKeyToLease.entrySet()) {
+                long leaseId = ((Number) entry.getValue()).longValue();
+                keyToLease.put(entry.getKey(), leaseId);
+            }
+        }
+
+        // 7. 恢复 leaseId -> keys 映射
+        Map<String, Object> loadedLeaseToKeys = (Map<String, Object>) snapshot.get("leaseToKeys");
+        if (loadedLeaseToKeys != null) {
+            for (Map.Entry<String, Object> entry : loadedLeaseToKeys.entrySet()) {
+                long leaseId = Long.parseLong(entry.getKey());
+                Object keysObj = entry.getValue();
+                List<String> keys;
+                if (keysObj instanceof List) {
+                    keys = (List<String>) keysObj;
+                } else {
+                    keys = new ArrayList<>((Set<String>) keysObj);
+                }
+                Set<String> keySet = ConcurrentHashMap.newKeySet();
+                keySet.addAll(keys);
+                leaseToKeys.put(leaseId, keySet);
+            }
+        }
     }
 
     /**
