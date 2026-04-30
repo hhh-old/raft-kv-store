@@ -109,7 +109,8 @@ public class KVStoreStateMachine extends StateMachineAdapter {
     private final AtomicLong leaderTerm = new AtomicLong(-1);
     
     // JSON 序列化工具
-    private final ObjectMapper objectMapper = new ObjectMapper();
+    private final ObjectMapper objectMapper = new ObjectMapper()
+            .configure(com.fasterxml.jackson.databind.DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES, false);
 
     // ==================== Watch 机制相关字段 ====================
     
@@ -471,6 +472,10 @@ public class KVStoreStateMachine extends StateMachineAdapter {
                 // Lease 撤销操作
                 applyLeaseRevoke(task.getLeaseId());
                 break;
+            case KVTask.OP_COMPACT:
+                // 压缩历史版本
+                applyCompact(task.getCompactRevision());
+                break;
             default:
                 LOG.warn("Unknown operation: {}", task.getOp());
         }
@@ -598,6 +603,28 @@ public class KVStoreStateMachine extends StateMachineAdapter {
         mvccStore.revokeLease(leaseId);
 
         LOG.info("Lease revoked: id={}, removed {} keys", leaseId, keys.size());
+    }
+
+    /**
+     * 应用 Compact 压缩操作 - 清理历史版本
+     *
+     * @param compactRevision 要压缩到的 revision
+     */
+    private void applyCompact(Long compactRevision) {
+        if (compactRevision == null || compactRevision <= 0) {
+            LOG.warn("Invalid compact revision: {}", compactRevision);
+            return;
+        }
+
+        long currentRev = mvccStore.getCurrentRevision();
+        if (compactRevision > currentRev) {
+            LOG.warn("Compact revision {} > current revision {}, skipping", compactRevision, currentRev);
+            return;
+        }
+
+        int removedCount = mvccStore.compact(compactRevision);
+        LOG.info("Compact completed: compactRevision={}, currentRevision={}, removedVersions={}",
+                compactRevision, currentRev, removedCount);
     }
     
     /**

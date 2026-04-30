@@ -47,6 +47,7 @@ public class KVTask implements Serializable {
     public static final String OP_TXN = "TXN";
     public static final String OP_LEASE_GRANT = "LEASE_GRANT";
     public static final String OP_LEASE_REVOKE = "LEASE_REVOKE";
+    public static final String OP_COMPACT = "COMPACT";
 
     /**
      * 租约 ID（ Lease 相关操作使用）
@@ -63,6 +64,11 @@ public class KVTask implements Serializable {
      * 用于 Leader 切换后新 Leader 正确计算剩余 TTL
      */
     private Long grantedTime;
+
+    /**
+     * 压缩目标 revision（Compact 操作使用）
+     */
+    private Long compactRevision;
 
     /**
      * 事务请求（当 op 为 TXN 时使用）
@@ -148,6 +154,24 @@ public class KVTask implements Serializable {
         task.setKey("");
         task.setValue(null);
         task.setLeaseId(leaseId);
+        task.setTimestamp(System.currentTimeMillis());
+        task.setRequestId(requestId);
+        return task;
+    }
+
+    /**
+     * 创建 Compact 压缩任务
+     *
+     * @param compactRevision 压缩目标 revision
+     * @param requestId 请求 ID
+     * @return KVTask
+     */
+    public static KVTask compact(long compactRevision, String requestId) {
+        KVTask task = new KVTask();
+        task.setOp(OP_COMPACT);
+        task.setKey("");
+        task.setValue(null);
+        task.setCompactRevision(compactRevision);
         task.setTimestamp(System.currentTimeMillis());
         task.setRequestId(requestId);
         return task;

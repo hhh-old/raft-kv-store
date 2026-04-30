@@ -96,20 +96,4 @@ public class KVResponse {
         response.setRequestId(requestId);
         return response;
     }
-
-    /**
-     * 检查是否是 NOT_LEADER 错误
-     */
-    @com.fasterxml.jackson.annotation.JsonIgnore
-    public boolean isNotLeader() {
-        return "NOT_LEADER".equals(error);
-    }
-
-    /**
-     * 获取 Leader URL（用于重定向）
-     */
-    @com.fasterxml.jackson.annotation.JsonIgnore
-    public String getLeaderUrl() {
-        return leaderEndpoint;
-    }
 }

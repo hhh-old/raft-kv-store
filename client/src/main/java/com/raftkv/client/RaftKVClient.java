@@ -351,6 +351,233 @@ public class RaftKVClient {
         throw new RuntimeException("GET_ALL failed after " + maxRetries + " attempts", lastException);
     }
 
+    // ==================== Range 查询（对齐 etcd v3 API） ====================
+
+    /**
+     * Range 查询 - 对齐 etcd v3 Range API
+     *
+     * 支持的参数：
+     * - key: 起始键
+     * - rangeEnd: 结束键（可选，null 表示单一键查询）
+     * - limit: 返回条数限制（0 表示无限制）
+     * - revision: 读取指定版本（0 表示最新）
+     * - sortOrder: 排序顺序
+     * - sortTarget: 排序字段
+     * - countOnly: 仅返回计数
+     *
+     * 示例：
+     * // 单一键查询
+     * RangeResponse resp = client.range("key1");
+     *
+     * // 范围查询 [key1, key3)
+     * RangeResponse resp = client.range("key1", "key3");
+     *
+     * // 前缀查询（limit=10，排序）
+     * RangeResponse resp = client.range()
+     *     .key("/users/")
+     *     .rangeEnd("/users0")
+     *     .limit(10)
+     *     .sortOrder(RangeRequest.SortOrder.ASC)
+     *     .sortTarget(RangeRequest.SortTarget.KEY)
+     *     .execute();
+     *
+     * @param request Range 请求
+     * @return Range 响应
+     */
+    public RangeResponse range(RangeRequest request) {
+        log.debug("Range request: key={}, rangeEnd={}, limit={}, revision={}, sortOrder={}, sortTarget={}, countOnly={}",
+                request.getKey(), request.getRangeEnd(), request.getLimit(), request.getRevision(),
+                request.getSortOrder(), request.getSortTarget(), request.isCountOnly());
+
+        return executeRangeWithRetry(request);
+    }
+
+    /**
+     * 便捷方法：单一键查询
+     */
+    public RangeResponse range(String key) {
+        return range(RangeRequest.builder().key(key).build());
+    }
+
+    /**
+     * 便捷方法：范围查询
+     */
+    public RangeResponse range(String key, String rangeEnd) {
+        return range(RangeRequest.builder().key(key).rangeEnd(rangeEnd).build());
+    }
+
+    /**
+     * 创建 Range 请求构建器
+     */
+    public RangeRequestBuilder range() {
+        return new RangeRequestBuilder();
+    }
+
+    /**
+     * Range 请求构建器
+     */
+    public class RangeRequestBuilder {
+        private String key;
+        private String rangeEnd;
+        private long limit = 0;
+        private long revision = 0;
+        private RangeRequest.SortOrder sortOrder = RangeRequest.SortOrder.NONE;
+        private RangeRequest.SortTarget sortTarget = RangeRequest.SortTarget.KEY;
+        private boolean countOnly = false;
+
+        public RangeRequestBuilder key(String key) {
+            this.key = key;
+            return this;
+        }
+
+        public RangeRequestBuilder rangeEnd(String rangeEnd) {
+            this.rangeEnd = rangeEnd;
+            return this;
+        }
+
+        public RangeRequestBuilder limit(long limit) {
+            this.limit = limit;
+            return this;
+        }
+
+        public RangeRequestBuilder revision(long revision) {
+            this.revision = revision;
+            return this;
+        }
+
+        public RangeRequestBuilder sortOrder(RangeRequest.SortOrder sortOrder) {
+            this.sortOrder = sortOrder;
+            return this;
+        }
+
+        public RangeRequestBuilder sortTarget(RangeRequest.SortTarget sortTarget) {
+            this.sortTarget = sortTarget;
+            return this;
+        }
+
+        public RangeRequestBuilder countOnly(boolean countOnly) {
+            this.countOnly = countOnly;
+            return this;
+        }
+
+        public RangeResponse execute() {
+            RangeRequest request = RangeRequest.builder()
+                    .key(key)
+                    .rangeEnd(rangeEnd)
+                    .limit(limit)
+                    .revision(revision)
+                    .sortOrder(sortOrder)
+                    .sortTarget(sortTarget)
+                    .countOnly(countOnly)
+                    .build();
+            return range(request);
+        }
+    }
+
+    /**
+     * 执行 Range 请求（带重试、故障转移和 Leader 重定向）
+     */
+    private RangeResponse executeRangeWithRetry(RangeRequest request) {
+        Exception lastException = null;
+        java.util.Set<String> triedEndpoints = new java.util.HashSet<>();
+
+        for (int attempt = 1; attempt <= maxRetries; attempt++) {
+            try {
+                String url = getCurrentLeader() + "/kv/range";
+                String jsonBody = objectMapper.writeValueAsString(request);
+
+                log.debug("Range attempt {} using endpoint: {}", attempt, getCurrentLeader());
+
+                HttpRequest httpRequest = HttpRequest.newBuilder()
+                        .uri(URI.create(url))
+                        .timeout(Duration.ofSeconds(timeoutSeconds))
+                        .header("Content-Type", "application/json")
+                        .POST(HttpRequest.BodyPublishers.ofString(jsonBody))
+                        .build();
+
+                HttpResponse<String> response = httpClient.send(httpRequest, HttpResponse.BodyHandlers.ofString());
+
+                if (response.statusCode() == 301) {
+                    String location = response.headers().firstValue("Location").orElse(null);
+                    if (location != null) {
+                        updateLeader(location.replace("/kv/range", ""));
+                    }
+                    continue;
+                }
+
+                if (response.statusCode() != 200) {
+                    throw new RuntimeException("Range failed: HTTP " + response.statusCode());
+                }
+
+                RangeResponse rangeResponse = objectMapper.readValue(response.body(), RangeResponse.class);
+
+                // 处理 NOT_LEADER 重定向
+                while ("NOT_LEADER".equals(rangeResponse.getError()) && rangeResponse.getLeaderEndpoint() != null) {
+                    log.info("Range redirecting to leader: {}", rangeResponse.getLeaderEndpoint());
+                    updateLeader(rangeResponse.getLeaderEndpoint());
+                    rangeResponse = executeRangeOnce(request);
+                }
+
+                markEndpointHealthy(getCurrentLeader());
+                return rangeResponse;
+
+            } catch (Exception e) {
+                lastException = e;
+                String currentEndpoint = getCurrentLeader();
+                log.warn("Range attempt {} failed on {}: {}", attempt, currentEndpoint, e.getMessage());
+
+                if (isConnectionFailure(e)) {
+                    markEndpointUnhealthy(currentEndpoint);
+                    triedEndpoints.add(currentEndpoint);
+                    String available = findAvailableEndpoint(triedEndpoints);
+                    if (available != null) {
+                        log.info("Connection failure, switching to available endpoint: {}", available);
+                        updateLeader(available);
+                        continue;
+                    }
+                }
+
+                if (attempt < maxRetries) {
+                    if (attempt == 1 && e instanceof java.net.http.HttpTimeoutException) {
+                        continue;
+                    }
+                    long waitTime = calculateBackoff(attempt);
+                    try {
+                        Thread.sleep(waitTime);
+                    } catch (InterruptedException ie) {
+                        Thread.currentThread().interrupt();
+                        throw new RuntimeException("Retry interrupted", ie);
+                    }
+                }
+            }
+        }
+
+        throw new RuntimeException("Range failed after " + maxRetries + " attempts", lastException);
+    }
+
+    /**
+     * 执行单次 Range 请求
+     */
+    private RangeResponse executeRangeOnce(RangeRequest request) throws Exception {
+        String url = getCurrentLeader() + "/kv/range";
+        String jsonBody = objectMapper.writeValueAsString(request);
+
+        HttpRequest httpRequest = HttpRequest.newBuilder()
+                .uri(URI.create(url))
+                .timeout(Duration.ofSeconds(timeoutSeconds))
+                .header("Content-Type", "application/json")
+                .POST(HttpRequest.BodyPublishers.ofString(jsonBody))
+                .build();
+
+        HttpResponse<String> response = httpClient.send(httpRequest, HttpResponse.BodyHandlers.ofString());
+
+        if (response.statusCode() != 200) {
+            throw new RuntimeException("Range failed: HTTP " + response.statusCode());
+        }
+
+        return objectMapper.readValue(response.body(), RangeResponse.class);
+    }
+
     /**
      * 遍历所有配置的节点，找到当前 Leader 并更新内部 Leader 引用。
      *
@@ -421,24 +648,24 @@ public class RaftKVClient {
                 log.debug("Attempt {} to {} using endpoint: {}", attempt, operation, currentEndpoint);
                 
                 KVResponse response = executor.execute();
-                log.debug("Response: success={}, error={}, leaderUrl={}, isNotLeader={}",
-                    response.isSuccess(), response.getError(), response.getLeaderUrl(), response.isNotLeader());
+                log.debug("Response: success={}, error={}, leaderEndpoint={}",
+                    response.isSuccess(), response.getError(), response.getLeaderEndpoint());
 
                 // 成功：标记端点健康，处理可能的 Leader 重定向
                 markEndpointHealthy(currentEndpoint);
-                
+
                 // 处理重定向循环：直到不是重定向为止
-                while (response.isNotLeader() && response.getLeaderUrl() != null) {
-                    log.info("Redirecting to Leader: {}", response.getLeaderUrl());
-                    updateLeader(response.getLeaderUrl());
+                while ("NOT_LEADER".equals(response.getError()) && response.getLeaderEndpoint() != null) {
+                    log.info("Redirecting to Leader: {}", response.getLeaderEndpoint());
+                    updateLeader(response.getLeaderEndpoint());
                     log.debug("Updated leader, retrying with: {}", currentLeader.get());
-                    
+
                     // 重定向到新 Leader 后，标记新端点为健康
                     markEndpointHealthy(getCurrentLeader());
-                    
+
                     response = executor.execute();
-                    log.debug("After redirect - Response: success={}, error={}, isNotLeader={}",
-                        response.isSuccess(), response.getError(), response.isNotLeader());
+                    log.debug("After redirect - Response: success={}, error={}",
+                        response.isSuccess(), response.getError());
                 }
 
                 // 此时 response 不是重定向
@@ -1424,7 +1651,146 @@ public class RaftKVClient {
                 .build();
         return transaction(txnRequest);
     }
-    
+
+    // ==================== Compact 压缩（对齐 etcd v3 API） ====================
+
+    /**
+     * 压缩历史版本 - 对齐 etcd v3 Compaction API
+     *
+     * 压缩流程：
+     * 1. 将压缩请求提交到 Leader
+     * 2. Leader 将请求复制到集群
+     * 3. 集群多数节点确认后，应用到状态机
+     * 4. revision < compactRevision 的历史版本被删除
+     *
+     * etcd 语义：
+     * - compaction 是幂等的，多次压缩同一 revision 都返回成功
+     * - 压缩后无法再通过 Range 查询被压缩的历史版本
+     * - Watch 的 startRevision 如果小于压缩版本会收到 COMPACT_REVISION 错误
+     *
+     * 示例：
+     * // 压缩到当前 revision - 1（保留最新版本）
+     * long currentRev = client.getCurrentRevision();
+     * CompactResponse resp = client.compact(currentRev - 1);
+     *
+     * @param request 压缩请求
+     * @return 压缩响应
+     */
+    public CompactResponse compact(CompactRequest request) {
+        log.debug("Compact request: revision={}, requestId={}", request.getRevision(), request.getRequestId());
+
+        return executeCompactWithRetry(request);
+    }
+
+    /**
+     * 便捷方法：压缩到指定 revision
+     */
+    public CompactResponse compact(long revision) {
+        return compact(CompactRequest.of(revision));
+    }
+
+    /**
+     * 便捷方法：压缩到当前 revision - 1（保留最新版本）
+     */
+    public CompactResponse compactToPreviousRevision() {
+        long currentRevision = getCurrentRevision();
+        if (currentRevision <= 1) {
+            throw new RuntimeException("Current revision is too small to compact");
+        }
+        return compact(currentRevision - 1);
+    }
+
+    /**
+     * 执行 Compact 请求（带重试、故障转移和 Leader 重定向）
+     */
+    private CompactResponse executeCompactWithRetry(CompactRequest request) {
+        Exception lastException = null;
+        java.util.Set<String> triedEndpoints = new java.util.HashSet<>();
+
+        for (int attempt = 1; attempt <= maxRetries; attempt++) {
+            try {
+                String url = getCurrentLeader() + "/kv/compact";
+                String jsonBody = objectMapper.writeValueAsString(request);
+
+                log.debug("Compact attempt {} using endpoint: {}", attempt, getCurrentLeader());
+
+                HttpRequest httpRequest = HttpRequest.newBuilder()
+                        .uri(URI.create(url))
+                        .timeout(Duration.ofSeconds(timeoutSeconds))
+                        .header("Content-Type", "application/json")
+                        .POST(HttpRequest.BodyPublishers.ofString(jsonBody))
+                        .build();
+
+                HttpResponse<String> response = httpClient.send(httpRequest, HttpResponse.BodyHandlers.ofString());
+
+                if (response.statusCode() == 301) {
+                    String location = response.headers().firstValue("Location").orElse(null);
+                    if (location != null) {
+                        updateLeader(location.replace("/kv/compact", ""));
+                    }
+                    continue;
+                }
+
+                // 对于错误响应（400, 500 等），尝试解析响应体获取错误信息
+                if (response.statusCode() != 200) {
+                    try {
+                        CompactResponse errorResponse = objectMapper.readValue(response.body(), CompactResponse.class);
+                        log.warn("Compact request failed: HTTP {}, error={}", response.statusCode(), errorResponse.getError());
+                        return errorResponse;
+                    } catch (Exception parseEx) {
+                        throw new RuntimeException("Compact failed: HTTP " + response.statusCode() + ", body: " + response.body());
+                    }
+                }
+
+                CompactResponse compactResponse = objectMapper.readValue(response.body(), CompactResponse.class);
+
+                // 处理 NOT_LEADER 重定向
+                if ("NOT_LEADER".equals(compactResponse.getError())) {
+                    String leaderUrl = compactResponse.getErrorDetail();
+                    if (leaderUrl != null && leaderUrl.startsWith("Redirect to ")) {
+                        leaderUrl = leaderUrl.substring("Redirect to ".length());
+                        updateLeader(leaderUrl);
+                    }
+                    continue;
+                }
+
+                markEndpointHealthy(getCurrentLeader());
+                return compactResponse;
+
+            } catch (Exception e) {
+                lastException = e;
+                String currentEndpoint = getCurrentLeader();
+                log.warn("Compact attempt {} failed on {}: {}", attempt, currentEndpoint, e.getMessage());
+
+                if (isConnectionFailure(e)) {
+                    markEndpointUnhealthy(currentEndpoint);
+                    triedEndpoints.add(currentEndpoint);
+                    String available = findAvailableEndpoint(triedEndpoints);
+                    if (available != null) {
+                        log.info("Connection failure, switching to available endpoint: {}", available);
+                        updateLeader(available);
+                        continue;
+                    }
+                }
+
+                if (attempt < maxRetries) {
+                    if (attempt == 1 && e instanceof java.net.http.HttpTimeoutException) {
+                        continue;
+                    }
+                    long waitTime = calculateBackoff(attempt);
+                    try {
+                        Thread.sleep(waitTime);
+                    } catch (InterruptedException ie) {
+                        Thread.currentThread().interrupt();
+                        throw new RuntimeException("Retry interrupted", ie);
+                    }
+                }
+            }
+        }
+
+        throw new RuntimeException("Compact failed after " + maxRetries + " attempts", lastException);
+    }
+
     /**
      * 获取分布式锁
      */

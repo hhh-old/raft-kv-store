@@ -24,6 +24,7 @@ import org.springframework.stereotype.Service;
 import java.io.File;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashMap;
 import java.util.List;
@@ -58,7 +59,8 @@ public class RaftKVService {
     private RaftGroupService raftGroupService;
     private Node node;
     private KVStoreStateMachine stateMachine;
-    private final ObjectMapper objectMapper = new ObjectMapper();
+    private final ObjectMapper objectMapper = new ObjectMapper()
+            .configure(com.fasterxml.jackson.databind.DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES, false);
     private volatile boolean initialized = false;
 
     // Lease ID 生成器（从 1 开始递增）
@@ -860,11 +862,125 @@ public class RaftKVService {
 
     /**
      * 获取当前全局版本号（用于 Watch 机制）
-     * 
+     *
      * @return 当前 revision，如果状态机未初始化返回 0
      */
     public long getCurrentRevision() {
         return stateMachine != null ? stateMachine.getCurrentRevision() : 0;
+    }
+
+    // ==================== Range 查询（对齐 etcd） ====================
+
+    /**
+     * Range 查询 - 对齐 etcd v3 Range API
+     *
+     * 支持的参数：
+     * - key: 起始键
+     * - rangeEnd: 结束键（可选）
+     * - limit: 返回条数限制
+     * - revision: 读取指定版本（0 表示最新）
+     * - sortOrder: 排序顺序
+     * - sortTarget: 排序字段
+     * - countOnly: 仅返回计数
+     *
+     * 使用 ReadIndex 机制保证线性一致性：
+     * 1. 记录当前的 committed index（ReadIndex）
+     * 2. Leader 向 Follower 发送心跳，确认自己仍是 Leader
+     * 3. 收到大多数 Follower 确认后，读取状态机数据
+     * 4. 基于指定 revision 做快照读（支持历史版本查询）
+     *
+     * @param request Range 请求
+     * @return Range 响应
+     */
+    public RangeResponse range(RangeRequest request) {
+        // 生成请求 ID（用于追踪和日志）
+        final String requestId = request.getRequestId() != null && !request.getRequestId().isEmpty()
+                ? request.getRequestId() : UUID.randomUUID().toString();
+
+        // 1. 检查当前节点是否是 Leader
+        if (!isLeader()) {
+            String leader = getLeaderHttpUrl();
+            if (leader != null) {
+                return RangeResponse.notLeader(leader, requestId);
+            }
+            return RangeResponse.failure("NO_LEADER", "No leader available", requestId);
+        }
+
+        // 2. 使用 ReadIndex 进行线性一致性读
+        try {
+            CompletableFuture<RangeResponse> future = new CompletableFuture<>();
+
+            // 采样当前 revision（final 供匿名内部类使用）
+            final long readRevision = stateMachine.getCurrentRevision();
+
+            // 序列化 request 到 context
+            byte[] requestContext = objectMapper.writeValueAsBytes(request);
+
+            node.readIndex(requestContext, new ReadIndexClosure() {
+                @Override
+                public void run(Status status, long index, byte[] reqCtx) {
+                    if (status.isOk()) {
+                        try {
+                            // 解析 RangeRequest
+                            RangeRequest req =
+                                    objectMapper.readValue(reqCtx, RangeRequest.class);
+
+                            // 确定要读取的 revision
+                            // 如果请求指定了 revision，使用它；否则使用采样时的 revision
+                            long targetRevision = (req.getRevision() > 0) ? req.getRevision() : readRevision;
+
+                            // 创建 RangeRequest（更新 revision）
+                            RangeRequest queryRequest = RangeRequest.builder()
+                                    .key(req.getKey())
+                                    .rangeEnd(req.getRangeEnd())
+                                    .limit(req.getLimit())
+                                    .revision(targetRevision)
+                                    .sortOrder(req.getSortOrder())
+                                    .sortTarget(req.getSortTarget())
+                                    .countOnly(req.isCountOnly())
+                                    .requestId(requestId)
+                                    .build();
+
+                            // 执行 Range 查询
+                            MVCCStore.RangeResult result = mvccStore.range(queryRequest);
+
+                            // 转换为 API 层的 KeyValue 并构建响应
+                            RangeResponse response = RangeResponse.success(
+                                    result.toApiKeyValues(),
+                                    result.count,
+                                    result.revision,
+                                    result.more,
+                                    requestId,
+                                    getCurrentEndpoint()
+                            );
+
+                            LOG.debug("Range query successful: key={}, rangeEnd={}, count={}, revision={}, more={}",
+                                    req.getKey(), req.getRangeEnd(), result.count, result.revision, result.more);
+
+                            future.complete(response);
+                        } catch (Exception e) {
+                            LOG.error("Range query error", e);
+                            future.complete(RangeResponse.failure(
+                                    "INTERNAL_ERROR", e.getMessage(), requestId));
+                        }
+                    } else {
+                        LOG.warn("ReadIndex failed for range: {}", status.getErrorMsg());
+                        future.complete(RangeResponse.failure(
+                                "READ_FAILED", status.getErrorMsg(), requestId));
+                    }
+                }
+            });
+
+            // 3. 等待 ReadIndex 完成
+            return future.get(raftProperties.getReadTimeout(), TimeUnit.MILLISECONDS);
+
+        } catch (TimeoutException e) {
+            LOG.error("Range query timeout: key={}", request.getKey());
+            return RangeResponse.failure("READ_TIMEOUT", "ReadIndex timeout", requestId);
+        } catch (Exception e) {
+            LOG.error("Range query error: key={}", request.getKey(), e);
+            return RangeResponse.failure("INTERNAL_ERROR", e.getMessage(), requestId);
+        }
     }
 
     /**
@@ -1016,6 +1132,127 @@ public class RaftKVService {
         } catch (Exception e) {
             LOG.error("Failed to execute transaction: requestId={}", requestId, e);
             return TxnResponse.error("Failed to execute transaction: " + e.getMessage());
+        }
+    }
+
+    // ==================== Compact 压缩（对齐 etcd） ====================
+
+    /**
+     * 压缩历史版本 - 对齐 etcd v3 Compaction API
+     *
+     * 压缩流程：
+     * 1. 检查当前节点是否是 Leader
+     * 2. 验证 revision 参数（必须是正数，且 <= 当前 revision）
+     * 3. 将压缩请求提交到 Raft 日志
+     * 4. 等待日志被 committed 并应用到状态机
+     * 5. 返回压缩结果
+     *
+     * etcd 语义：
+     * - compaction 是幂等的，多次压缩同一 revision 都返回成功
+     * - 压缩后 revision < compactRevision 的历史版本被删除
+     * - 无法再通过 Range 查询被压缩的历史版本
+     * - Watch 的 startRevision 如果小于压缩版本会收到 COMPACT_REVISION 错误
+     *
+     * @param request 压缩请求
+     * @return 压缩响应
+     */
+    public CompactResponse compact(CompactRequest request) {
+        // 生成请求 ID
+        final String requestId;
+        if (request.getRequestId() == null || request.getRequestId().isEmpty()) {
+            requestId = UUID.randomUUID().toString();
+        } else {
+            requestId = request.getRequestId();
+        }
+
+        // 1. 检查当前节点是否是 Leader
+        if (!isLeader()) {
+            String leader = getLeaderHttpUrl();
+            return CompactResponse.failure(
+                    "NOT_LEADER",
+                    leader != null ? "Redirect to " + leader : "No leader available",
+                    requestId);
+        }
+
+        // 2. 验证 revision 参数
+        long compactRevision = request.getRevision();
+        if (compactRevision <= 0) {
+            return CompactResponse.failure(
+                    "BAD_REQUEST",
+                    "revision must be a positive integer",
+                    requestId);
+        }
+
+        // 3. 获取当前 revision，检查是否有效
+        long currentRevision = stateMachine.getCurrentRevision();
+        if (compactRevision > currentRevision) {
+            return CompactResponse.failure(
+                    "REVISION_TOO_LARGE",
+                    "compactRevision " + compactRevision + " > currentRevision " + currentRevision,
+                    requestId);
+        }
+
+        // 4. 提交到 Raft 日志
+        try {
+            // 创建 KVTask 对象，封装压缩操作
+            KVTask task = KVTask.compact(compactRevision, requestId);
+
+            byte[] data = objectMapper.writeValueAsBytes(task);
+            ByteBuffer dataBuffer = ByteBuffer.wrap(data);
+
+            CountDownLatch latch = new CountDownLatch(1);
+            AtomicReference<Status> statusRef = new AtomicReference<>();
+            AtomicReference<Long> compactedRevisionRef = new AtomicReference<>();
+
+            Task raftTask = new Task(dataBuffer, new com.alipay.sofa.jraft.Closure() {
+                @Override
+                public void run(Status status) {
+                    statusRef.set(status);
+                    if (status.isOk()) {
+                        // 从状态机获取压缩后的实际 revision
+                        compactedRevisionRef.set(stateMachine.getCurrentRevision());
+                    }
+                    latch.countDown();
+                }
+            });
+
+            node.apply(raftTask);
+
+            // 等待操作完成
+            boolean success = latch.await(raftProperties.getWriteTimeout(), TimeUnit.MILLISECONDS);
+            if (!success) {
+                LOG.error("Compact timeout: requestId={}, revision={}", requestId, compactRevision);
+                return CompactResponse.failure(
+                        "TIMEOUT",
+                        "Compact operation timed out",
+                        requestId);
+            }
+
+            Status status = statusRef.get();
+            if (status != null && status.isOk()) {
+                // 返回请求的 compactRevision，而不是当前 revision
+                // 因为用户请求压缩到 revision X，compact 操作会删除 revision < X 的历史
+                long compactedRev = compactRevision;
+                LOG.info("Compact successful: requestId={}, compactRevision={}, compactedRevision={}",
+                        requestId, compactRevision, compactedRev);
+                return CompactResponse.success(
+                        compactedRev,
+                        requestId,
+                        getCurrentEndpoint());
+            } else {
+                String errorMsg = status != null ? status.getErrorMsg() : "Unknown error";
+                LOG.error("Compact failed: requestId={}, error={}", requestId, errorMsg);
+                return CompactResponse.failure(
+                        "COMPACT_FAILED",
+                        errorMsg,
+                        requestId);
+            }
+        } catch (Exception e) {
+            LOG.error("Compact error: requestId={}, revision={}", requestId, compactRevision, e);
+            return CompactResponse.failure(
+                    "INTERNAL_ERROR",
+                    e.getMessage(),
+                    requestId);
         }
     }
 

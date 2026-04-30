@@ -1,5 +1,6 @@
 package com.raftkv.service;
 
+import com.raftkv.entity.RangeRequest;
 import lombok.Data;
 import lombok.extern.slf4j.Slf4j;
 
@@ -143,7 +144,7 @@ public class MVCCStore {
 
     // key -> 版本历史 (NavigableMap: revision -> KeyValue)
     // 使用 ConcurrentSkipListMap 保证线程安全且有序
-    private final Map<String, NavigableMap<Revision, KeyValue>> keyIndex;
+    private final NavigableMap<String, NavigableMap<Revision, KeyValue>> keyIndex;
 
     // 全局 revision 计数器 - 每次修改递增
     private volatile long currentRevision;
@@ -164,7 +165,11 @@ public class MVCCStore {
     private final Map<Long, Set<String>> leaseToKeys;
 
     public MVCCStore() {
-        this.keyIndex = new ConcurrentHashMap<>();
+        // 使用 ConcurrentSkipListMap 保持 key 的字典序
+        // - 支持按 key 的自然顺序遍历（用于 Range 查询）
+        // - 线程安全，支持高并发读写
+        // - 写操作由 Raft 单线程 apply，读操作无锁
+        this.keyIndex = new ConcurrentSkipListMap<>();
         this.currentRevision = 0;
         this.keyVersions = new ConcurrentHashMap<>();
         this.leaseMetas = new ConcurrentHashMap<>();
@@ -609,8 +614,8 @@ public class MVCCStore {
         List<KeyValue> result = new ArrayList<>();
 
         // 使用 TreeMap 的有序性进行范围查询
-        TreeMap<String, NavigableMap<Revision, KeyValue>> sortedKeys = new TreeMap<>(keyIndex);
-        NavigableMap<String, NavigableMap<Revision, KeyValue>> subMap = sortedKeys.subMap(startKey, true, endKey, false);
+        NavigableMap<String, NavigableMap<Revision, KeyValue>> subMap =
+                keyIndex.subMap(startKey, true, endKey, false);
 
         for (Map.Entry<String, NavigableMap<Revision, KeyValue>> entry : subMap.entrySet()) {
             KeyValue latest = getLatest(entry.getKey());
@@ -619,6 +624,187 @@ public class MVCCStore {
             }
         }
         return result;
+    }
+
+    // ==================== Range 增强（对齐 etcd Range API） ====================
+
+    /**
+     * Range 查询结果包装类
+     */
+    public static class RangeResult {
+        /** 键值对列表（排除 tombstone） */
+        public final List<KeyValue> kvs;
+        /** 匹配的总数（可用于分页） */
+        public final long count;
+        /** 是否还有更多数据（limit 限制时） */
+        public final boolean more;
+        /** 读取时的全局版本号 */
+        public final long revision;
+
+        public RangeResult(List<KeyValue> kvs, long count, boolean more, long revision) {
+            this.kvs = kvs;
+            this.count = count;
+            this.more = more;
+            this.revision = revision;
+        }
+
+        /**
+         * 转换为 API 层的 KeyValue 列表
+         */
+        public List<com.raftkv.entity.RangeResponse.KeyValue> toApiKeyValues() {
+            List<com.raftkv.entity.RangeResponse.KeyValue> result = new ArrayList<>();
+            for (KeyValue kv : kvs) {
+                result.add(com.raftkv.entity.RangeResponse.KeyValue.builder()
+                        .key(kv.getKey())
+                        .value(kv.getValue())
+                        .revision(kv.getRevision().getMainRev())
+                        .createRevision(kv.getCreateRevision().getMainRev())
+                        .version(kv.getVersion())
+                        .leaseId(kv.getLeaseId())
+                        .build());
+            }
+            return result;
+        }
+    }
+
+    /**
+     * 对齐 etcd 的 Range 查询
+     *
+     * 支持的参数：
+     * - key: 起始键
+     * - rangeEnd: 结束键（null 表示单一键查询）
+     * - limit: 返回条数限制（0 表示无限制）
+     * - revision: 读取指定版本（0 表示最新）
+     * - sortOrder: 排序顺序（NONE/ASC/DESC）
+     * - sortTarget: 排序字段（KEY/VERSION/CREATE/MOD/VALUE）
+     * - countOnly: 仅返回计数
+     *
+     * @param request Range 请求参数
+     * @return Range 结果
+     */
+    public RangeResult range(RangeRequest request) {
+        String key = request.getKey();
+        String rangeEnd = request.getRangeEnd();
+        long limit = request.getLimit();
+        long targetRevision = request.getRevision();
+        boolean countOnly = request.isCountOnly();
+
+        // 1. 确定读取的 revision
+        // revision=0 表示读取最新，否则读取指定历史版本
+        long readRevision = (targetRevision > 0) ? targetRevision : currentRevision;
+
+        log.debug("Range: key={}, rangeEnd={}, readRevision={}, currentRevision={}",
+                key, rangeEnd, readRevision, currentRevision);
+
+        // 2. 收集符合条件的 key
+        List<KeyValue> allKvs = new ArrayList<>();
+
+        if (rangeEnd == null || rangeEnd.isEmpty()) {
+            // 单一键查询
+            NavigableMap<Revision, KeyValue> history = keyIndex.get(key);
+            log.debug("Range: keyIndex.get({}) = {}", key, history != null ? "found with " + history.size() + " entries" : "null");
+
+            KeyValue kv = getKeyAtRevision(key, readRevision);
+            log.debug("Range: getKeyAtRevision({}, {}) = {}", key, readRevision, kv);
+
+            if (kv != null && !kv.isTombstone()) {
+                allKvs.add(kv);
+            }
+        } else {
+            // 范围查询 [key, rangeEnd)
+            // keyIndex 已经是 ConcurrentSkipListMap，按 key 字典序排列
+            // 直接使用 subMap 获取有序子集
+            NavigableMap<String, NavigableMap<Revision, KeyValue>> subMap;
+
+
+            subMap = keyIndex.subMap(key, true, rangeEnd, false);
+            for (Map.Entry<String, NavigableMap<Revision, KeyValue>> entry : subMap.entrySet()) {
+                KeyValue kv = getKeyAtRevision(entry.getKey(), readRevision);
+                if (kv != null && !kv.isTombstone()) {
+                    allKvs.add(kv);
+                }
+            }
+        }
+
+        // 3. 记录总数
+        long totalCount = allKvs.size();
+
+        // 4. 如果是 countOnly，直接返回
+        if (countOnly) {
+            return new RangeResult(new ArrayList<>(), totalCount, false, readRevision);
+        }
+
+        // 5. 排序
+        List<KeyValue> sortedKvs = sortKeyValues(allKvs, request.getSortOrder(), request.getSortTarget());
+
+        // 6. 应用 limit
+        boolean more = false;
+        if (limit > 0 && sortedKvs.size() > limit) {
+            sortedKvs = new ArrayList<>(sortedKvs.subList(0, (int) limit));
+            more = true;
+        }
+
+        return new RangeResult(sortedKvs, totalCount, more, readRevision);
+    }
+
+    /**
+     * 获取 key 在指定 revision 时的值（排除 tombstone）
+     */
+    private KeyValue getKeyAtRevision(String key, long targetRevision) {
+        NavigableMap<Revision, KeyValue> history = keyIndex.get(key);
+        if (history == null || history.isEmpty()) {
+            return null;
+        }
+
+        // 找到小于等于 targetRevision 的最新版本
+        Revision target = new Revision(targetRevision, Long.MAX_VALUE);
+        Map.Entry<Revision, KeyValue> entry = history.floorEntry(target);
+
+        return entry != null ? entry.getValue() : null;
+    }
+
+    /**
+     * 排序 KeyValue 列表
+     */
+    private List<KeyValue> sortKeyValues(List<KeyValue> kvs,
+                                          RangeRequest.SortOrder sortOrder,
+                                          RangeRequest.SortTarget sortTarget) {
+        if (sortOrder == RangeRequest.SortOrder.NONE) {
+            return kvs; // 不排序，保持自然顺序
+        }
+
+        Comparator<KeyValue> comparator;
+
+        switch (sortTarget) {
+            case VERSION:
+                comparator = Comparator.comparingLong(KeyValue::getVersion);
+                break;
+            case CREATE:
+                comparator = Comparator.comparingLong((KeyValue kv) -> kv.getCreateRevision().getMainRev());
+                break;
+            case MOD:
+                comparator = Comparator.comparingLong((KeyValue kv) -> kv.getRevision().getMainRev());
+                break;
+            case VALUE:
+                comparator = Comparator.comparing(
+                        kv -> kv.getValue() != null ? kv.getValue() : "",
+                        Comparator.nullsLast(String::compareTo)
+                );
+                break;
+            case KEY:
+            default:
+                comparator = Comparator.comparing(KeyValue::getKey);
+                break;
+        }
+
+        // 根据排序方向调整
+        if (sortOrder == RangeRequest.SortOrder.DESC) {
+            comparator = comparator.reversed();
+        }
+
+        List<KeyValue> sorted = new ArrayList<>(kvs);
+        sorted.sort(comparator);
+        return sorted;
     }
 
     // ==================== 删除操作 ====================
