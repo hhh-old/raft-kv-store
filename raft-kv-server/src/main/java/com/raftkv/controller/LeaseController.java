@@ -38,17 +38,9 @@ public class LeaseController {
     @PostMapping("/grant")
     public ResponseEntity<LeaseGrantResponse> grant(@RequestBody LeaseGrantRequest request) {
         log.info("Lease grant request: ttl={}", request.getTtl());
-        LeaseGrantResponse response = raftKVService.leaseGrant(request.getTtl());
 
-        if (!response.isSuccess() && "NOT_LEADER".equals(response.getError())) {
-            String leaderUrl = raftKVService.getLeaderHttpUrl();
-            if (leaderUrl != null) {
-                return ResponseEntity.status(301)
-                        .header("Location", leaderUrl + "/lease/grant")
-                        .body(response);
-            }
-            return ResponseEntity.status(503).body(response);
-        }
+        // Service 层会抛出 NotLeaderException，由全局异常处理器处理重定向
+        LeaseGrantResponse response = raftKVService.leaseGrant(request.getTtl());
 
         return ResponseEntity.ok(response);
     }
@@ -61,20 +53,11 @@ public class LeaseController {
     @PostMapping("/revoke")
     public ResponseEntity<Map<String, Object>> revoke(@RequestBody LeaseRevokeRequest request) {
         log.info("Lease revoke request: id={}", request.getId());
+
+        // Service 层会抛出 NotLeaderException，由全局异常处理器处理重定向
         boolean success = raftKVService.leaseRevoke(request.getId());
 
         Map<String, Object> response = new HashMap<>();
-        if (!success && !raftKVService.isLeader()) {
-            String leaderUrl = raftKVService.getLeaderHttpUrl();
-            if (leaderUrl != null) {
-                return ResponseEntity.status(301)
-                        .header("Location", leaderUrl + "/lease/revoke")
-                        .body(response);
-            }
-            response.put("error", "No leader available");
-            return ResponseEntity.status(503).body(response);
-        }
-
         response.put("success", success);
         return ResponseEntity.ok(response);
     }
@@ -83,6 +66,8 @@ public class LeaseController {
      * Lease KeepAlive（续约）
      *
      * 请求体：{"id": 1}
+     *
+     * 注意：Service 层会抛出 NotLeaderException，由全局异常处理器处理重定向
      */
     @PostMapping("/keepalive")
     public ResponseEntity<Map<String, Object>> keepAlive(@RequestBody LeaseKeepAliveRequest request) {
@@ -90,17 +75,6 @@ public class LeaseController {
         boolean success = raftKVService.leaseKeepAlive(request.getId());
 
         Map<String, Object> response = new HashMap<>();
-        if (!success && !raftKVService.isLeader()) {
-            String leaderUrl = raftKVService.getLeaderHttpUrl();
-            if (leaderUrl != null) {
-                return ResponseEntity.status(301)
-                        .header("Location", leaderUrl + "/lease/keepalive")
-                        .body(response);
-            }
-            response.put("error", "No leader available");
-            return ResponseEntity.status(503).body(response);
-        }
-
         response.put("success", success);
         return ResponseEntity.ok(response);
     }
@@ -109,7 +83,9 @@ public class LeaseController {
      * 查询 Lease 剩余 TTL
      *
      * @param id 租约 ID
-     * @return 剩余秒数
+     * @return 剩余秒数，-1 表示租约不存在
+     *
+     * 注意：Service 层会抛出 NotLeaderException，由全局异常处理器处理重定向
      */
     @GetMapping("/ttl")
     public ResponseEntity<Map<String, Object>> ttl(@RequestParam long id) {
@@ -117,17 +93,6 @@ public class LeaseController {
         long ttl = raftKVService.leaseTtl(id);
 
         Map<String, Object> response = new HashMap<>();
-        if (ttl < 0 && !raftKVService.isLeader()) {
-            String leaderUrl = raftKVService.getLeaderHttpUrl();
-            if (leaderUrl != null) {
-                return ResponseEntity.status(301)
-                        .header("Location", leaderUrl + "/lease/ttl?id=" + id)
-                        .body(response);
-            }
-            response.put("error", "No leader available");
-            return ResponseEntity.status(503).body(response);
-        }
-
         response.put("id", id);
         response.put("ttl", ttl);
         return ResponseEntity.ok(response);
@@ -139,19 +104,11 @@ public class LeaseController {
      * @return Lease 列表
      */
     @GetMapping("/leases")
-    public ResponseEntity<?> leases() {
+    public ResponseEntity<Map<String, Object>> leases() {
         log.debug("Lease leases request");
-        List<Long> leaseIds = raftKVService.leaseLeases();
 
-        if (leaseIds == null && !raftKVService.isLeader()) {
-            String leaderUrl = raftKVService.getLeaderHttpUrl();
-            if (leaderUrl != null) {
-                return ResponseEntity.status(301)
-                        .header("Location", leaderUrl + "/lease/leases")
-                        .body("{\"error\":\"NOT_LEADER\"}");
-            }
-            return ResponseEntity.status(503).body("{\"error\":\"NO_LEADER_AVAILABLE\"}");
-        }
+        // Service 层会抛出 NotLeaderException，由全局异常处理器处理重定向
+        List<Long> leaseIds = raftKVService.leaseLeases();
 
         Map<String, Object> response = new HashMap<>();
         response.put("leases", leaseIds != null ? leaseIds : java.util.Collections.emptyList());

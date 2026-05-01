@@ -156,9 +156,14 @@ public class WatchController {
 
     /**
      * 取消 Watch 订阅
+     *
+     * 注意：Watch 订阅只在 Leader 节点上维护，非 Leader 请求需要重定向
      */
     @DeleteMapping("/{watchId}")
     public ResponseEntity<Map<String, Object>> cancelWatch(@PathVariable String watchId) {
+        // Leader 校验：Watch 订阅只在 Leader 上维护
+        raftKVService.checkLeaderAndThrow();
+
         log.info("Canceling watch: {}", watchId);
         WatchSubscription sub = watchManager.getSubscription(watchId);
         if (sub != null) {
@@ -172,13 +177,18 @@ public class WatchController {
 
     /**
      * 获取当前全局版本号
-     * 
+     *
      * 客户端断线重连时，可先调用此接口获取 currentRevision，
      * 然后用 startRevision = currentRevision + 1 重新创建 Watch，
      * 确保不漏掉断线期间发生的事件。
+     *
+     * 注意：Follower 节点可能存在 revision 滞后，此接口必须走 Leader 保证读到最新值
      */
     @GetMapping("/revision")
     public ResponseEntity<Map<String, Object>> getRevision() {
+        // Leader 校验：revision 可能滞后，必须走 Leader 才能读到最新值
+        raftKVService.checkLeaderAndThrow();
+
         Map<String, Object> response = new HashMap<>();
         response.put("revision", raftKVService.getCurrentRevision());
         response.put("activeWatches", watchManager.getActiveWatchCount());
@@ -189,9 +199,14 @@ public class WatchController {
      * 获取当前最小可用 revision（管理接口）
      *
      * 客户端可据此判断断线后能否用当前 lastReceivedRevision 继续追赶历史事件。
+     *
+     * 注意：eventHistory 是 Leader 专属内存数据，非 Leader 请求需要重定向
      */
     @GetMapping("/compact-revision")
     public ResponseEntity<Map<String, Object>> getCompactRevision() {
+        // Leader 校验：eventHistory 只在 Leader 上维护
+        raftKVService.checkLeaderAndThrow();
+
         Map<String, Object> response = new HashMap<>();
         response.put("oldestRevision", eventHistory.getOldestRevision());
         response.put("latestRevision", eventHistory.getLatestRevision());
@@ -201,9 +216,14 @@ public class WatchController {
 
     /**
      * Watch 统计信息（管理接口）
+     *
+     * 注意：Watch 订阅只在 Leader 上维护，非 Leader 永远返回 0，必须走 Leader
      */
     @GetMapping("/stats")
     public ResponseEntity<Map<String, Object>> getWatchStats() {
+        // Leader 校验：Watch 订阅是 Leader 专属资源，统计信息必须在 Leader 上查询
+        raftKVService.checkLeaderAndThrow();
+
         Map<String, Object> response = new HashMap<>();
         response.put("activeWatches", watchManager.getActiveWatchCount());
         return ResponseEntity.ok(response);

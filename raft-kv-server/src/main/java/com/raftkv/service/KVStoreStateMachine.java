@@ -788,6 +788,16 @@ public class KVStoreStateMachine extends StateMachineAdapter {
         LOG.info("onLeaderStop: status={}", status);
         this.leaderTerm.set(-1);
 
+        // 清理 Watch 订阅：Watch 是 Leader 专属资源，失去 Leader 地位后立即清理
+        // 防止旧 Leader 继续向客户端推送事件（重复/僵尸事件）
+        if (watchManager != null) {
+            try {
+                watchManager.clearAllWatches();
+            } catch (Exception e) {
+                LOG.error("Failed to clear watches on leader stop: {}", e.getMessage(), e);
+            }
+        }
+
         // 触发 Leader 停止回调（通知 RaftKVService 停止 Lease 过期检测）
         if (leaderStopCallback != null) {
             try {

@@ -106,18 +106,22 @@ public class LeaseManager {
      * 从 MVCCStore 重新加载 Lease 状态（Leader 切换时调用）
      *
      * 关键逻辑：从 MVCCStore 获取 grantedTime（原始授予时间），计算真实的剩余时间
-     * 然后设置到当前时间点，给予客户端完整的 TTL 宽限期
+     * 然后设置到当前时间点。
      *
-     * <b>etcd 宽限期设计</b>：
-     * - 即使 lease 在旧 Leader 上已经过期，只要 MVCCStore 中存在元数据，
-     *   新 Leader 就应该给予完整的 TTL 宽限期（而非严格计算剩余时间）
-     * - 这样客户端有机会通过 KeepAlive 续约，重新获得完整的 TTL
-     * - 避免了旧 Leader 刚过期但客户端来不及续约就被新 Leader 判定为过期的问题
+     * <b>宽限期策略</b>：
+     * - 未过期 lease（remainingMs > 0）：使用真实剩余时间，客户端可继续 KeepAlive 续约
+     * - 已过期 lease（remainingMs <= 0）：设为立即过期（expiryTime = now），
+     *   由过期检测线程在首次检测时（500ms 内）触发 leaseRevoke 清理
+     *
+     * 为什么已过期 lease 不给予宽限期：
+     * - 如果 lease 确实已过期，绑定的 key 应该被自动删除
+     * - 给予完整 TTL 宽限期会导致已过期 key 多活一个 TTL 周期
+     * - 极端场景（集群完全重启）：所有已过期 lease 会全部复活，引发锁冲突/死锁
      *
      * 例如：
      * - Lease 于 T=0 授予，TTL=15秒
-     * - T=5 时 Leader 切换，新 Leader reload
-     * - 即使剩余时间 < 0，也给予 full TTL 宽限期（新 expiryTime = now + ttl）
+     * - T=5 时 Leader 切换，新 Leader reload → 剩余 10s，正常恢复
+     * - T=20 时 Leader 切换（lease 已过期），新 Leader reload → 立即过期，快速清理
      */
     public void reloadFromStore() {
         java.util.Collection<MVCCStore.LeaseMeta> metas = mvccStore.getAllLeaseMetas();
@@ -130,15 +134,13 @@ public class LeaseManager {
             // 计算剩余 TTL（毫秒）
             long elapsed = now - grantedTime;
             long remainingMs = meta.ttl * 1000L - elapsed;
-            // etcd 宽限期设计：即使已过期，也给予完整的 TTL 宽限期
-            // 这给了客户端在 Leader 切换期间续约的机会
             if (remainingMs <= 0) {
-                log.info("reloadFromStore: lease {} expired (remainingMs={}), granting full grace period ttl={}s",
-                        meta.id, remainingMs, meta.ttl);
-                // 给予完整的 TTL 作为宽限期
-                leaseExpiryTimes.put(meta.id, now + meta.ttl * 1000L);
+                // 已过期：设为立即过期，让过期检测线程快速清理
+                log.info("reloadFromStore: lease {} already expired (remainingMs={}), setting immediate expiration",
+                        meta.id, remainingMs);
+                leaseExpiryTimes.put(meta.id, now);
             } else {
-                // 未过期，使用真实的剩余时间作为宽限期
+                // 未过期：使用真实的剩余时间
                 leaseExpiryTimes.put(meta.id, now + remainingMs);
                 log.info("reloadFromStore: loaded lease id={}, ttl={}, grantedTime={}, remainingMs={}",
                         meta.id, meta.ttl, grantedTime, remainingMs);

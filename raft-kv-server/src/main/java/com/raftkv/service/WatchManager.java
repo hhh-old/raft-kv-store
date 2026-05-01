@@ -27,7 +27,7 @@ import javax.annotation.PreDestroy;
 
 /**
  * Watch 管理器 - 管理所有的 Watch 订阅和事件分发
- *
+ * watch应该是leader的专属资源
  * 核心职责：
  * 1. 管理活跃的 Watch 订阅（注册、关闭、查询）
  * 2. 将事件路由到匹配的订阅者
@@ -463,5 +463,53 @@ public class WatchManager {
     public boolean hasWatch(String watchId) {
         WatchSubscription sub = activeWatches.get(watchId);
         return sub != null && !sub.closed;
+    }
+
+    /**
+     * 清理所有 Watch 订阅
+     *
+     * 调用时机：当前节点失去 Leader 地位时（KVStoreStateMachine.onLeaderStop）
+     *
+     * 为什么需要：
+     * 1. Watch 订阅是 Leader 专属资源，只在 Leader 节点上维护
+     * 2. 旧 Leader 变成 Follower 后，必须立即清理所有 SSE 连接
+     * 3. 防止旧 Leader 继续向客户端推送事件（重复/僵尸事件）
+     * 4. 缩短客户端感知 Leader 切换的时间（比等待 30 秒心跳更快）
+     *
+     * 清理流程：
+     * 1. 标记所有订阅为 closed
+     * 2. 完成所有 emitter（触发客户端连接断开）
+     * 3. 清空所有索引
+     */
+    public void clearAllWatches() {
+        int count = activeWatches.size();
+        if (count == 0) {
+            return;
+        }
+
+        LOG.info("Clearing all {} watch subscriptions due to leader change", count);
+
+        // 1. 拷贝避免遍历时并发修改
+        List<WatchSubscription> subscriptions = new ArrayList<>(activeWatches.values());
+
+        // 2. 标记关闭并完成 emitter
+        for (WatchSubscription sub : subscriptions) {
+            sub.closed = true;
+            if (!sub.completed) {
+                sub.completed = true;
+                try {
+                    sub.emitter.complete();
+                } catch (Exception e) {
+                    // 忽略：连接可能已断开
+                }
+            }
+        }
+
+        // 3. 清空所有索引
+        activeWatches.clear();
+        exactMatchIndex.clear();
+        prefixWatches.clear();
+
+        LOG.info("All watch subscriptions cleared: {}", count);
     }
 }

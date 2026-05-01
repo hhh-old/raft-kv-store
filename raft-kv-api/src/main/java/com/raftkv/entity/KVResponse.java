@@ -12,7 +12,7 @@ import lombok.NoArgsConstructor;
 @Builder
 @NoArgsConstructor
 @AllArgsConstructor
-public class KVResponse {
+public class KVResponse implements RaftBaseResponse {
 
     /**
      * Whether the operation was successful

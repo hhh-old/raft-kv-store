@@ -21,7 +21,7 @@ import java.util.List;
 @Builder
 @NoArgsConstructor
 @AllArgsConstructor
-public class RangeResponse {
+public class RangeResponse implements RaftBaseResponse {
 
     /**
      * 键值对列表

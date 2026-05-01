@@ -188,10 +188,10 @@ public class RangeIntegrationTest {
                 client.put(key, "value");
             }
 
-            RangeResponse response = client.range()
+            RangeResponse response = client.range(RangeRequest.builder()
                     .key(prefix)
                     .rangeEnd(prefix + "zzz")
-                    .execute();
+                    .build());
 
             assertTrue(response.isSuccess());
             assertEquals(3, response.getCount());
@@ -233,11 +233,11 @@ public class RangeIntegrationTest {
                 client.put(key, "value");
             }
 
-            RangeResponse response = client.range()
+            RangeResponse response = client.range(RangeRequest.builder()
                     .key(prefix)
                     .rangeEnd(prefix + "zzz")
                     .limit(3)
-                    .execute();
+                    .build());
 
             assertTrue(response.isSuccess());
             assertEquals(10, response.getCount());
@@ -276,12 +276,12 @@ public class RangeIntegrationTest {
             client.put(keys[0], "v2");
             client.put(keys[2], "v3");
 
-            RangeResponse response = client.range()
+            RangeResponse response = client.range(RangeRequest.builder()
                     .key("")
                     .rangeEnd("sort_key_")
                     .sortOrder(RangeRequest.SortOrder.ASC)
                     .sortTarget(RangeRequest.SortTarget.KEY)
-                    .execute();
+                    .build());
 
             assertTrue(response.isSuccess());
             if (response.getKvs().size() >= 3) {
@@ -324,12 +324,12 @@ public class RangeIntegrationTest {
 
             client.put(key, "v4");
 
-            RangeResponse response = client.range()
+            RangeResponse response = client.range(RangeRequest.builder()
                     .key(prefix)
                     .rangeEnd(prefix + "zzz")
                     .sortOrder(RangeRequest.SortOrder.DESC)
                     .sortTarget(RangeRequest.SortTarget.VERSION)
-                    .execute();
+                    .build());
 
             assertTrue(response.isSuccess());
             LOG.info("Sort by VERSION DESC passed: version={}", currentVersion);
@@ -361,11 +361,11 @@ public class RangeIntegrationTest {
                 client.put(key, "value");
             }
 
-            RangeResponse response = client.range()
+            RangeResponse response = client.range(RangeRequest.builder()
                     .key(prefix)
                     .rangeEnd(prefix + "zzz")
                     .countOnly(true)
-                    .execute();
+                    .build());
 
             assertTrue(response.isSuccess());
             assertEquals(4, response.getCount());
@@ -405,10 +405,10 @@ public class RangeIntegrationTest {
 
             long midRevision = startRevision + 2;
             if (midRevision > 0 && midRevision < latestRevision) {
-                RangeResponse response = client.range()
+                RangeResponse response = client.range(RangeRequest.builder()
                         .key(key)
                         .revision(midRevision)
-                        .execute();
+                        .build());
 
                 assertTrue(response.isSuccess());
                 assertEquals(1, response.getKvs().size());
@@ -447,20 +447,20 @@ public class RangeIntegrationTest {
             long afterDelete = client.getCurrentRevision();
 
             // 查询创建时的 revision，应该返回 v1
-            RangeResponse respBeforeDelete = client.range()
+            RangeResponse respBeforeDelete = client.range(RangeRequest.builder()
                     .key(key)
                     .revision(afterCreate)
-                    .execute();
+                    .build());
             assertTrue(respBeforeDelete.isSuccess());
             assertEquals(1, respBeforeDelete.getKvs().size(),
                     "Query at create revision should return the value");
             assertEquals("v1", respBeforeDelete.getKvs().get(0).getValue());
 
             // 查询删除后的 revision，应该返回空（tombstone 被过滤）
-            RangeResponse respAfterDelete = client.range()
+            RangeResponse respAfterDelete = client.range(RangeRequest.builder()
                     .key(key)
                     .revision(afterDelete)
-                    .execute();
+                    .build());
             assertTrue(respAfterDelete.isSuccess());
             assertEquals(0, respAfterDelete.getKvs().size(),
                     "Query at delete revision should return empty (tombstone filtered)");
@@ -500,21 +500,21 @@ public class RangeIntegrationTest {
             client.put(key, "v3");  // revision rev4, version 1 (新生命周期)
 
             // 查询第一个生命周期的数据
-            RangeResponse resp1 = client.range().key(key).revision(rev1).execute();
+            RangeResponse resp1 = client.range(RangeRequest.builder().key(key).revision(rev1).build());
             assertTrue(resp1.isSuccess());
             assertEquals(1, resp1.getKvs().size());
             assertEquals("v1", resp1.getKvs().get(0).getValue());
             assertEquals(1, resp1.getKvs().get(0).getVersion());
 
             // 查询第二个生命周期的数据
-            RangeResponse resp4 = client.range().key(key).revision(rev4).execute();
+            RangeResponse resp4 = client.range(RangeRequest.builder().key(key).revision(rev4).build());
             assertTrue(resp4.isSuccess());
             assertEquals(1, resp4.getKvs().size());
             assertEquals("v3", resp4.getKvs().get(0).getValue());
             assertEquals(1, resp4.getKvs().get(0).getVersion());  // 新生命周期，version 从 1 开始
 
             // 查询 tombstone revision，应该返回空
-            RangeResponse respTombstone = client.range().key(key).revision(rev3).execute();
+            RangeResponse respTombstone = client.range(RangeRequest.builder().key(key).revision(rev3).build());
             assertTrue(respTombstone.isSuccess());
             assertEquals(0, respTombstone.getKvs().size());
 
@@ -555,21 +555,21 @@ public class RangeIntegrationTest {
             long afterDelete = client.getCurrentRevision();
 
             // 查询插入后的 revision，应该返回所有 3 个 key
-            RangeResponse respBeforeDelete = client.range()
+            RangeResponse respBeforeDelete = client.range(RangeRequest.builder()
                     .key(prefix)
                     .rangeEnd(prefix + "z")
                     .revision(afterInsert)
-                    .execute();
+                    .build());
             assertTrue(respBeforeDelete.isSuccess());
             assertEquals(3, respBeforeDelete.getKvs().size(),
                     "Query before delete should return all 3 keys");
 
             // 查询删除后的 revision，应该只返回 a 和 c
-            RangeResponse respAfterDelete = client.range()
+            RangeResponse respAfterDelete = client.range(RangeRequest.builder()
                     .key(prefix)
                     .rangeEnd(prefix + "z")
                     .revision(afterDelete)
-                    .execute();
+                    .build());
             assertTrue(respAfterDelete.isSuccess());
             assertEquals(2, respAfterDelete.getKvs().size(),
                     "Query after delete should return only 2 keys (b was deleted)");
@@ -614,14 +614,14 @@ public class RangeIntegrationTest {
             client.put(keys[1], "value_b");
             client.put(keys[2], "value_c");
 
-            RangeResponse response = client.range()
+            RangeResponse response = client.range(RangeRequest.builder()
                     .key(prefix)
                     .rangeEnd(prefix + "zzz")
                     .limit(2)
                     .sortOrder(RangeRequest.SortOrder.ASC)
                     .sortTarget(RangeRequest.SortTarget.KEY)
                     .countOnly(false)
-                    .execute();
+                    .build());
 
             assertTrue(response.isSuccess());
             assertEquals(3, response.getCount());

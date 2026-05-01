@@ -19,7 +19,7 @@ import java.io.Serializable;
 @Builder
 @NoArgsConstructor
 @AllArgsConstructor
-public class LeaseGrantResponse implements Serializable {
+public class LeaseGrantResponse implements Serializable, RaftBaseResponse {
 
     private static final long serialVersionUID = 1L;
 

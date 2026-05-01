@@ -11,8 +11,10 @@ import com.alipay.sofa.jraft.entity.Task;
 import com.alipay.sofa.jraft.option.NodeOptions;
 import com.alipay.sofa.jraft.rpc.RaftRpcServerFactory;
 import com.alipay.sofa.jraft.rpc.RpcServer;
+import com.fasterxml.jackson.databind.DeserializationFeature;
 import com.raftkv.config.RaftProperties;
 import com.raftkv.entity.*;
+import com.raftkv.exception.NotLeaderException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import javax.annotation.PostConstruct;
 import javax.annotation.PreDestroy;
@@ -30,10 +32,8 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
-import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.CountDownLatch;
-import java.util.concurrent.TimeUnit;
-import java.util.concurrent.TimeoutException;
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 
 /**
@@ -60,20 +60,26 @@ public class RaftKVService {
     private Node node;
     private KVStoreStateMachine stateMachine;
     private final ObjectMapper objectMapper = new ObjectMapper()
-            .configure(com.fasterxml.jackson.databind.DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES, false);
+            .configure(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES, false);
     private volatile boolean initialized = false;
 
     // Lease ID 生成器（从 1 开始递增）
-    private final java.util.concurrent.atomic.AtomicLong leaseIdGenerator = new java.util.concurrent.atomic.AtomicLong(0);
+    private final AtomicLong leaseIdGenerator = new AtomicLong(0);
 
     // Lease 过期检测定时器
-    private final java.util.concurrent.ScheduledExecutorService leaseExpirationExecutor =
-            java.util.concurrent.Executors.newSingleThreadScheduledExecutor(r -> {
+    private final ScheduledExecutorService leaseExpirationExecutor =
+            Executors.newSingleThreadScheduledExecutor(r -> {
                 Thread t = new Thread(r, "lease-expiration-worker");
                 t.setDaemon(true);
                 return t;
             });
-    private volatile java.util.concurrent.ScheduledFuture<?> leaseExpirationFuture;
+    private volatile ScheduledFuture<?> leaseExpirationFuture;
+
+    // Lease 撤销失败退避记录：leaseId -> 上次失败时间戳
+    // 防止同一个 lease 在临时故障时无限重试，产生大量错误日志
+    private final ConcurrentHashMap<Long, Long> leaseRevokeFailTime =
+            new ConcurrentHashMap<>();
+    private static final long LEASE_REVOKE_RETRY_BACKOFF_MS = 5000; // 5 秒退避
     
     // 存储所有节点的 raft endpoint -> http endpoint 映射
     // 用于 Leader 重定向时查找正确的 HTTP URL
@@ -302,6 +308,21 @@ public class RaftKVService {
     }
 
     /**
+     * 检查 Leader 并在非 Leader 时抛出 NotLeaderException
+     *
+     * 职责：纯业务层校验，不关心 HTTP 请求细节。
+     * 重定向 URL 由 GlobalRaftExceptionHandler 从 HttpServletRequest 构建。
+     *
+     * @throws NotLeaderException 如果当前不是 Leader，携带 leaderUrl
+     */
+    public void checkLeaderAndThrow() {
+        if (!isLeader()) {
+            String leaderUrl = getLeaderHttpUrl();
+            throw new NotLeaderException(leaderUrl);
+        }
+    }
+
+    /**
      * 检查节点是否健康
      * 
      * 健康条件：
@@ -475,12 +496,8 @@ public class RaftKVService {
      * @return 操作结果
      */
     public KVResponse put(String key, String value, String requestId, Long leaseId) {
-        // 检查当前节点是否是 Leader
-        // Raft 协议规定：只有 Leader 能处理客户端的写请求
-        // 这是为了保证日志复制的顺序一致性
-        if (!isLeader()) {
-            return redirectToLeader(key, value);
-        }
+        // 检查当前节点是否是 Leader，抛出异常由全局处理器处理重定向
+        checkLeaderAndThrow();
 
         // 幂等检查：只有客户端提供了 requestId 才做幂等处理
         // 如果 requestId 为空，说明客户端不支持幂等，正常执行
@@ -586,9 +603,8 @@ public class RaftKVService {
      * @return 操作结果
      */
     public KVResponse delete(String key, String requestId) {
-        if (!isLeader()) {
-            return redirectToLeaderForDelete(key);
-        }
+        // 检查当前节点是否是 Leader，抛出异常由全局处理器处理重定向
+        checkLeaderAndThrow();
 
         // 幂等检查：只有客户端提供了 requestId 才做幂等处理
         if (requestId != null && !requestId.isEmpty()) {
@@ -669,22 +685,10 @@ public class RaftKVService {
     public KVResponse get(String key) {
         String requestId = UUID.randomUUID().toString();
 
-        // 1. 检查当前节点是否是 Leader
-        // 如果不是 Leader，返回 Leader 信息让客户端重定向
-        if (!isLeader()) {
-            String leader = getLeaderHttpUrl();
-            if (leader != null) {
-                return KVResponse.builder()
-                        .success(false)
-                        .error("NOT_LEADER")
-                        .leaderEndpoint(leader)
-                        .requestId(requestId)
-                        .build();
-            }
-            return KVResponse.failure("No leader available", requestId);
-        }
+        // 检查当前节点是否是 Leader，抛出异常由全局处理器处理重定向
+        checkLeaderAndThrow();
 
-        // 2. 使用 ReadIndex 进行线性一致性读
+        // 使用 ReadIndex 进行线性一致性读
         try {
             CompletableFuture<KVResponse> future = new CompletableFuture<>();
             
@@ -897,16 +901,10 @@ public class RaftKVService {
         final String requestId = request.getRequestId() != null && !request.getRequestId().isEmpty()
                 ? request.getRequestId() : UUID.randomUUID().toString();
 
-        // 1. 检查当前节点是否是 Leader
-        if (!isLeader()) {
-            String leader = getLeaderHttpUrl();
-            if (leader != null) {
-                return RangeResponse.notLeader(leader, requestId);
-            }
-            return RangeResponse.failure("NO_LEADER", "No leader available", requestId);
-        }
+        // 检查当前节点是否是 Leader，抛出异常由全局处理器处理重定向
+        checkLeaderAndThrow();
 
-        // 2. 使用 ReadIndex 进行线性一致性读
+        // 使用 ReadIndex 进行线性一致性读
         try {
             CompletableFuture<RangeResponse> future = new CompletableFuture<>();
 
@@ -1023,16 +1021,6 @@ public class RaftKVService {
                 .build();
     }
 
-    private KVResponse redirectToLeaderForDelete(String key) {
-        String leader = getLeaderHttpUrl();
-        return KVResponse.builder()
-                .success(false)
-                .error("NOT_LEADER")
-                .leaderEndpoint(leader)
-                .key(key)
-                .build();
-    }
-
     // ==================== 事务支持 ====================
 
     /**
@@ -1049,10 +1037,8 @@ public class RaftKVService {
      * @return 事务响应
      */
     public TxnResponse executeTransaction(TxnRequest txnRequest) {
-        // 检查当前节点是否是 Leader
-        if (!isLeader()) {
-            return TxnResponse.notLeader(getLeaderHttpUrl());
-        }
+        // 检查当前节点是否是 Leader，抛出异常由全局处理器处理重定向
+        checkLeaderAndThrow();
 
         // 如果没有提供 requestId，生成一个
         final String requestId;
@@ -1165,16 +1151,10 @@ public class RaftKVService {
             requestId = request.getRequestId();
         }
 
-        // 1. 检查当前节点是否是 Leader
-        if (!isLeader()) {
-            String leader = getLeaderHttpUrl();
-            return CompactResponse.failure(
-                    "NOT_LEADER",
-                    leader != null ? "Redirect to " + leader : "No leader available",
-                    requestId);
-        }
+        // 检查当前节点是否是 Leader，抛出异常由全局处理器处理重定向
+        checkLeaderAndThrow();
 
-        // 2. 验证 revision 参数
+        // 验证 revision 参数
         long compactRevision = request.getRevision();
         if (compactRevision <= 0) {
             return CompactResponse.failure(
@@ -1265,9 +1245,8 @@ public class RaftKVService {
      * @return LeaseGrantResponse
      */
     public LeaseGrantResponse leaseGrant(int ttl) {
-        if (!isLeader()) {
-            return LeaseGrantResponse.failure("NOT_LEADER");
-        }
+        // 检查当前节点是否是 Leader，抛出异常由全局处理器处理重定向
+        checkLeaderAndThrow();
 
         if (ttl <= 0) {
             ttl = 60; // 默认 60 秒
@@ -1319,9 +1298,8 @@ public class RaftKVService {
      * @return true 如果成功
      */
     public boolean leaseRevoke(long leaseId) {
-        if (!isLeader()) {
-            return false;
-        }
+        // 检查当前节点是否是 Leader，抛出异常由全局处理器处理重定向
+        checkLeaderAndThrow();
 
         try {
             String requestId = UUID.randomUUID().toString();
@@ -1361,11 +1339,10 @@ public class RaftKVService {
      *
      * @param leaseId 租约 ID
      * @return true 如果租约存在并成功续约
+     * @throws NotLeaderException 如果当前不是 Leader，由全局异常处理器处理重定向
      */
     public boolean leaseKeepAlive(long leaseId) {
-        if (!isLeader()) {
-            return false;
-        }
+        checkLeaderAndThrow();
         return leaseManager.keepAlive(leaseId);
     }
 
@@ -1374,11 +1351,10 @@ public class RaftKVService {
      *
      * @param leaseId 租约 ID
      * @return 剩余秒数，-1 表示不存在
+     * @throws NotLeaderException 如果当前不是 Leader，由全局异常处理器处理重定向
      */
     public long leaseTtl(long leaseId) {
-        if (!isLeader()) {
-            return -1;
-        }
+        checkLeaderAndThrow();
         // 优先从内存 LeaseManager 查（热路径，已包含真实的剩余 TTL）
         long ttl = leaseManager.getRemainingTtl(leaseId);
         if (ttl >= 0) {
@@ -1402,9 +1378,8 @@ public class RaftKVService {
      * @return Lease ID 列表
      */
     public List<Long> leaseLeases() {
-        if (!isLeader()) {
-            return null;
-        }
+        // 检查当前节点是否是 Leader，抛出异常由全局处理器处理重定向
+        checkLeaderAndThrow();
         return leaseManager.getAllLeaseIds();
     }
 
@@ -1416,11 +1391,31 @@ public class RaftKVService {
             return; // 已在运行
         }
         leaseExpirationFuture = leaseExpirationExecutor.scheduleWithFixedDelay(() -> {
+            // Leader 切换守卫：如果当前不是 Leader，立即退出，避免在旧 Leader 上继续撤销
+            if (!isLeader()) {
+                LOG.debug("Lease expiration worker skipped: not leader");
+                return;
+            }
             try {
                 List<Long> expired = leaseManager.getExpiredLeases();
+                long now = System.currentTimeMillis();
                 for (Long leaseId : expired) {
+                    // 失败退避：5 秒内撤销失败过的 lease 跳过，避免无限重试
+                    Long lastFail = leaseRevokeFailTime.get(leaseId);
+                    if (lastFail != null && now - lastFail < LEASE_REVOKE_RETRY_BACKOFF_MS) {
+                        LOG.debug("Lease revoke skipped due to backoff: id={}", leaseId);
+                        continue;
+                    }
+
                     LOG.info("Lease expired, revoking: id={}", leaseId);
-                    leaseRevoke(leaseId);
+                    boolean success = leaseRevoke(leaseId);
+                    if (!success) {
+                        LOG.warn("Lease revoke failed, will retry after backoff: id={}", leaseId);
+                        leaseRevokeFailTime.put(leaseId, now);
+                    } else {
+                        // 撤销成功，清理失败记录
+                        leaseRevokeFailTime.remove(leaseId);
+                    }
                 }
             } catch (Exception e) {
                 LOG.error("Lease expiration worker error", e);

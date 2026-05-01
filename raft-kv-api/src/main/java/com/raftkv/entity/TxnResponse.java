@@ -23,7 +23,7 @@ import java.util.Map;
 @Builder
 @NoArgsConstructor
 @AllArgsConstructor
-public class TxnResponse implements Serializable {
+public class TxnResponse implements Serializable, RaftBaseResponse {
 
     private static final long serialVersionUID = 1L;
 
@@ -33,6 +33,15 @@ public class TxnResponse implements Serializable {
      * false: 条件不满足，执行了 failure 操作
      */
     private boolean succeeded;
+
+    /**
+     * 实现 RaftBaseResponse 接口
+     * TxnResponse 使用 succeeded 字段而非 success
+     */
+    @Override
+    public boolean isSuccess() {
+        return succeeded;
+    }
 
     /**
      * 事务执行的操作列表（success 或 failure）

@@ -39,27 +39,6 @@ public class TxnController {
     private RaftKVService raftKVService;
 
     /**
-     * 构建重定向响应（如果不是 Leader）
-     * 
-     * @param response 原始响应
-     * @param basePath 基础路径（如 "/txn"）
-     * @return 如果是 NOT_LEADER 则返回重定向响应，否则返回 null
-     */
-    private ResponseEntity<TxnResponse> redirectIfNotLeader(TxnResponse response, String basePath) {
-        if (response.getError() != null && "NOT_LEADER".equals(response.getError())) {
-            String leaderHttpUrl = raftKVService.getLeaderHttpUrl();
-            if (leaderHttpUrl != null) {
-                return ResponseEntity.status(301)
-                        .header("Location", leaderHttpUrl + basePath)
-                        .body(response);
-            }
-            return ResponseEntity.status(503)
-                    .body(TxnResponse.error("No leader available"));
-        }
-        return null;
-    }
-
-    /**
      * 执行事务，其实etcd里面的事务就是一个cas操作
      *
      * 请求体格式：
@@ -99,13 +78,8 @@ public class TxnController {
                 request.getSuccess() != null ? request.getSuccess().size() : 0,
                 request.getFailure() != null ? request.getFailure().size() : 0);
 
+        // Service 层会抛出 NotLeaderException，由全局异常处理器处理重定向
         TxnResponse response = raftKVService.executeTransaction(request);
-
-        // 检查是否需要重定向
-        ResponseEntity<TxnResponse> redirectResponse = redirectIfNotLeader(response, "/txn");
-        if (redirectResponse != null) {
-            return redirectResponse;
-        }
 
         return ResponseEntity.ok(response);
     }
@@ -166,13 +140,8 @@ public class TxnController {
 
         TxnRequest txnRequest = txnBuilder.build();
 
+        // Service 层会抛出 NotLeaderException，由全局异常处理器处理重定向
         TxnResponse response = raftKVService.executeTransaction(txnRequest);
-
-        // 检查是否需要重定向
-        ResponseEntity<TxnResponse> redirectResponse = redirectIfNotLeader(response, "/txn/cas");
-        if (redirectResponse != null) {
-            return redirectResponse;
-        }
 
         return ResponseEntity.ok(response);
     }
@@ -206,13 +175,8 @@ public class TxnController {
                 .failure(java.util.List.of(Operation.get(lockKey)))
                 .build();
 
+        // Service 层会抛出 NotLeaderException，由全局异常处理器处理重定向
         TxnResponse response = raftKVService.executeTransaction(txnRequest);
-
-        // 检查是否需要重定向
-        ResponseEntity<TxnResponse> redirectResponse = redirectIfNotLeader(response, "/txn/lock");
-        if (redirectResponse != null) {
-            return redirectResponse;
-        }
 
         return ResponseEntity.ok(response);
     }
@@ -243,13 +207,8 @@ public class TxnController {
                 .failure(java.util.List.of(Operation.get(lockKey)))
                 .build();
 
+        // Service 层会抛出 NotLeaderException，由全局异常处理器处理重定向
         TxnResponse response = raftKVService.executeTransaction(txnRequest);
-
-        // 检查是否需要重定向
-        ResponseEntity<TxnResponse> redirectResponse = redirectIfNotLeader(response, "/txn/unlock");
-        if (redirectResponse != null) {
-            return redirectResponse;
-        }
 
         return ResponseEntity.ok(response);
     }

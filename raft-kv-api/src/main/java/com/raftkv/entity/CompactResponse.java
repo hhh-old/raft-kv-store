@@ -19,7 +19,7 @@ import lombok.NoArgsConstructor;
 @Builder
 @NoArgsConstructor
 @AllArgsConstructor
-public class CompactResponse {
+public class CompactResponse implements RaftBaseResponse {
 
     /**
      * 操作是否成功

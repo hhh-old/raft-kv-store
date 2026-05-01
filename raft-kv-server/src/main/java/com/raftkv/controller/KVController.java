@@ -32,27 +32,6 @@ public class KVController {
     private RaftKVService raftKVService;
 
     /**
-     * 构建重定向响应（如果不是 Leader）
-     * 
-     * @param response 原始响应
-     * @param basePath 基础路径（如 "/kv/key"）
-     * @return 如果是 NOT_LEADER 则返回重定向响应，否则返回 null
-     */
-    private ResponseEntity<KVResponse> redirectIfNotLeader(KVResponse response, String basePath) {
-        if (!response.isSuccess() && "NOT_LEADER".equals(response.getError())) {
-            String leaderHttpUrl = raftKVService.getLeaderHttpUrl();
-            if (leaderHttpUrl != null) {
-                return ResponseEntity.status(301)
-                        .header("Location", leaderHttpUrl + basePath)
-                        .body(response);
-            }
-            return ResponseEntity.status(503)
-                    .body(KVResponse.failure("No leader available", response.getRequestId()));
-        }
-        return null;
-    }
-
-    /**
      * PUT a key-value pair（支持幂等，支持带斜杠的key）
      *
      * @param key   The key (路径变量，支持简单key)
@@ -89,13 +68,8 @@ public class KVController {
         Long leaseId = leaseIdNum != null ? leaseIdNum.longValue() : null;
 
         log.info("PUT request: key={}, value={}, requestId={}, leaseId={}", actualKey, value, requestId, leaseId);
+        // Service 层会抛出 NotLeaderException，由全局异常处理器处理重定向
         KVResponse response = raftKVService.put(actualKey, value, requestId, leaseId);
-
-        // 检查是否需要重定向
-        ResponseEntity<KVResponse> redirectResponse = redirectIfNotLeader(response, "/kv/" + actualKey);
-        if (redirectResponse != null) {
-            return redirectResponse;
-        }
 
         return ResponseEntity.ok(response);
     }
@@ -121,13 +95,8 @@ public class KVController {
         }
 
         log.debug("GET request: key={}", actualKey);
+        // Service 层会抛出 NotLeaderException，由全局异常处理器处理重定向
         KVResponse response = raftKVService.get(actualKey);
-
-        // 检查是否需要重定向
-        ResponseEntity<KVResponse> redirectResponse = redirectIfNotLeader(response, "/kv/" + actualKey);
-        if (redirectResponse != null) {
-            return redirectResponse;
-        }
 
         return ResponseEntity.ok(response);
     }
@@ -155,13 +124,8 @@ public class KVController {
         }
 
         log.info("DELETE request: key={}, requestId={}", actualKey, requestId);
+        // Service 层会抛出 NotLeaderException，由全局异常处理器处理重定向
         KVResponse response = raftKVService.delete(actualKey, requestId);
-
-        // 检查是否需要重定向
-        ResponseEntity<KVResponse> redirectResponse = redirectIfNotLeader(response, "/kv/" + actualKey);
-        if (redirectResponse != null) {
-            return redirectResponse;
-        }
 
         return ResponseEntity.ok(response);
     }
@@ -170,27 +134,14 @@ public class KVController {
      * GET all key-value pairs (admin endpoint)
      *
      * 使用线性一致性读：只有 Leader 能处理此请求
-     * 非 Leader 节点会返回 301 重定向到 Leader
+     * 非 Leader 节点由全局异常处理器返回 301 重定向
      *
      * @return All key-value pairs
      */
     @GetMapping("/all")
-    public ResponseEntity<?> getAll() {
-        Map<String, String> result = raftKVService.getAll();
-        
-        // 如果返回 null，说明当前不是 Leader，需要重定向
-        if (result == null) {
-            String leaderHttpUrl = raftKVService.getLeaderHttpUrl();
-            if (leaderHttpUrl != null) {
-                return ResponseEntity.status(301)
-                        .header("Location", leaderHttpUrl + "/kv/all")
-                        .body("{\"error\":\"NOT_LEADER\",\"leaderEndpoint\":\"" + leaderHttpUrl + "\"}");
-            }
-            return ResponseEntity.status(503)
-                    .body("{\"error\":\"NO_LEADER_AVAILABLE\"}");
-        }
-        
-        return ResponseEntity.ok(result);
+    public ResponseEntity<Map<String, String>> getAll() {
+        // Service 层会抛出 NotLeaderException，由全局异常处理器处理重定向
+        return ResponseEntity.ok(raftKVService.getAll());
     }
 
     /**
@@ -316,19 +267,8 @@ public class KVController {
         log.debug("Range request: key={}, rangeEnd={}, limit={}, revision={}, sortOrder={}, sortTarget={}, countOnly={}",
                 key, rangeEnd, limit, revision, order, target, countOnly);
 
+        // Service 层会抛出 NotLeaderException，由全局异常处理器处理重定向
         RangeResponse response = raftKVService.range(request);
-
-        // 检查是否需要重定向
-        if ("NOT_LEADER".equals(response.getError())) {
-            String leaderUrl = response.getLeaderEndpoint();
-            if (leaderUrl != null) {
-                return ResponseEntity.status(301)
-                        .header("Location", leaderUrl + "/kv/range")
-                        .body(response);
-            }
-            return ResponseEntity.status(503)
-                    .body(RangeResponse.failure("NO_LEADER", "No leader available", response.getRequestId()));
-        }
 
         return ResponseEntity.ok(response);
     }
@@ -362,19 +302,8 @@ public class KVController {
         log.debug("Range POST request: key={}, rangeEnd={}, limit={}, revision={}",
                 request.getKey(), request.getRangeEnd(), request.getLimit(), request.getRevision());
 
+        // Service 层会抛出 NotLeaderException，由全局异常处理器处理重定向
         RangeResponse response = raftKVService.range(request);
-
-        // 检查是否需要重定向
-        if ("NOT_LEADER".equals(response.getError())) {
-            String leaderUrl = response.getLeaderEndpoint();
-            if (leaderUrl != null) {
-                return ResponseEntity.status(301)
-                        .header("Location", leaderUrl + "/kv/range")
-                        .body(response);
-            }
-            return ResponseEntity.status(503)
-                    .body(RangeResponse.failure("NO_LEADER", "No leader available", response.getRequestId()));
-        }
 
         return ResponseEntity.ok(response);
     }
@@ -415,19 +344,8 @@ public class KVController {
 
         log.info("Compact request: revision={}, requestId={}", request.getRevision(), request.getRequestId());
 
+        // Service 层会抛出 NotLeaderException，由全局异常处理器处理重定向
         CompactResponse response = raftKVService.compact(request);
-
-        // 检查是否需要重定向
-        if ("NOT_LEADER".equals(response.getError())) {
-            String leaderHttpUrl = raftKVService.getLeaderHttpUrl();
-            if (leaderHttpUrl != null) {
-                return ResponseEntity.status(301)
-                        .header("Location", leaderHttpUrl + "/kv/compact")
-                        .body(response);
-            }
-            return ResponseEntity.status(503)
-                    .body(CompactResponse.failure("NO_LEADER", "No leader available", response.getRequestId()));
-        }
 
         if (!response.isSuccess()) {
             log.error("Compact failed: error={}, detail={}", response.getError(), response.getErrorDetail());

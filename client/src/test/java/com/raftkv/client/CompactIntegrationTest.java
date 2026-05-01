@@ -411,10 +411,10 @@ public class CompactIntegrationTest {
                 assertTrue(response.isSuccess());
             }
 
-            RangeResponse response = client.range()
+            RangeResponse response = client.range(RangeRequest.builder()
                     .key(prefix)
                     .rangeEnd(prefix + "zzz")
-                    .execute();
+                    .build());
 
             assertTrue(response.isSuccess());
             assertEquals(3, response.getCount());
