@@ -4,6 +4,7 @@ import com.raftkv.entity.CompactRequest;
 import com.raftkv.entity.CompactResponse;
 import com.raftkv.entity.RangeRequest;
 import com.raftkv.entity.RangeResponse;
+import com.raftkv.client.watch.WatchListener;
 import com.raftkv.entity.WatchEvent;
 import org.junit.jupiter.api.Test;
 import org.slf4j.Logger;
@@ -320,7 +321,7 @@ public class CompactIntegrationTest {
             List<WatchEvent> receivedEvents = new CopyOnWriteArrayList<>();
 
             try {
-                RaftKVClient.WatchListener listener = client.watchFromRevision(key, initialRevision + 1, receivedEvents::add);
+                WatchListener listener = client.watchFromRevision(key, initialRevision + 1, receivedEvents::add);
 
                 Thread.sleep(2000);
 

@@ -1,6 +1,7 @@
 package com.raftkv.client;
 
 import com.raftkv.entity.LeaseGrantResponse;
+import com.raftkv.client.watch.WatchListener;
 import com.raftkv.entity.WatchEvent;
 import org.junit.jupiter.api.Test;
 import org.slf4j.Logger;
@@ -234,7 +235,7 @@ public class LeaseIntegrationTest {
         List<WatchEvent> events = new CopyOnWriteArrayList<>();
 
         // 先创建 Watch
-        RaftKVClient.WatchListener listener = client.watch(watchKey, events::add);
+        WatchListener listener = client.watch(watchKey, events::add);
         Thread.sleep(1000); // 等待 Watch 建立
 
         // 创建 Lease 并绑定

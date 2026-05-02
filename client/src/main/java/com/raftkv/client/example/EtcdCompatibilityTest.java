@@ -1,7 +1,7 @@
 package com.raftkv.client.example;
 
 import com.raftkv.client.RaftKVClient;
-import com.raftkv.client.RaftKVClient.WatchListener;
+import com.raftkv.client.watch.WatchListener;
 import com.raftkv.entity.*;
 import com.raftkv.entity.Compare.CompareOp;
 import lombok.extern.slf4j.Slf4j;

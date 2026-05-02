@@ -1,5 +1,6 @@
 package com.raftkv.client;
 
+import com.raftkv.client.watch.WatchListener;
 import com.raftkv.entity.WatchEvent;
 import org.junit.jupiter.api.Test;
 import org.slf4j.Logger;
@@ -75,7 +76,7 @@ public class ClientWatchFailoverTest {
         List<WatchEvent> allEvents = Collections.synchronizedList(new ArrayList<>());
         AtomicInteger eventCounter = new AtomicInteger(0);
 
-        RaftKVClient.WatchListener listener = client.watchFromRevision(testKey, 1, event -> {
+        WatchListener listener = client.watchFromRevision(testKey, 1, event -> {
             LOG.info("[EVENT] type={}, key={}, revision={}, value={}",
                     event.getType(), event.getKey(), event.getRevision(), event.getValue());
             allEvents.add(event);

@@ -1,6 +1,7 @@
 package com.raftkv.client.example;
 
 import com.raftkv.client.RaftKVClient;
+import com.raftkv.client.watch.WatchListener;
 import com.raftkv.entity.WatchEvent;
 import lombok.extern.slf4j.Slf4j;
 
@@ -97,7 +98,7 @@ public class WatchExample {
         System.out.println("  -d '{\"value\":\"mysql://localhost:3306\"}'\n");
 
         // 创建 Watch
-        RaftKVClient.WatchListener listener = client.watch(key, event -> {
+        WatchListener listener = client.watch(key, event -> {
             System.out.println("\n[收到事件]");
             System.out.println("  类型: " + event.getType());
             System.out.println("  Key: " + event.getKey());
@@ -136,7 +137,7 @@ public class WatchExample {
         System.out.println("  /config/app/name\n");
 
         // 创建前缀 Watch
-        RaftKVClient.WatchListener listener = client.watchPrefix(prefix, event -> {
+        WatchListener listener = client.watchPrefix(prefix, event -> {
             System.out.println("\n[前缀监听事件]");
             System.out.println("  类型: " + event.getType());
             System.out.println("  Key: " + event.getKey());
@@ -180,7 +181,7 @@ public class WatchExample {
         System.out.println("\n模拟断线重连，从历史版本 " + startRevision + " 开始监听...");
         System.out.println("应该能收到 3 个历史事件\n");
 
-        RaftKVClient.WatchListener listener = client.watchFromRevision(key, startRevision, event -> {
+        WatchListener listener = client.watchFromRevision(key, startRevision, event -> {
             System.out.println("\n[历史/实时事件]");
             System.out.println("  类型: " + event.getType());
             System.out.println("  Key: " + event.getKey());
@@ -209,17 +210,17 @@ public class WatchExample {
         System.out.println("同时创建多个 Watch，观察事件分发\n");
 
         // Watch 1: 监听 /config/database/url
-        RaftKVClient.WatchListener watch1 = client.watch("/config/database/url", event -> {
+        WatchListener watch1 = client.watch("/config/database/url", event -> {
             System.out.println("[Watch-1 数据库配置] " + event.getKey() + " = " + event.getValue());
         });
 
         // Watch 2: 监听 /config/redis/host
-        RaftKVClient.WatchListener watch2 = client.watch("/config/redis/host", event -> {
+        WatchListener watch2 = client.watch("/config/redis/host", event -> {
             System.out.println("[Watch-2 Redis配置] " + event.getKey() + " = " + event.getValue());
         });
 
         // Watch 3: 监听前缀 /config/（会收到所有配置变化）
-        RaftKVClient.WatchListener watch3 = client.watchPrefix("/config/", event -> {
+        WatchListener watch3 = client.watchPrefix("/config/", event -> {
             System.out.println("[Watch-3 所有配置] " + event.getType() + " " + event.getKey());
         });
 
